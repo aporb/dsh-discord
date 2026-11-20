@@ -1,0 +1,120 @@
+/**
+ * Markdown-aware splitting tests (11.6): when a chunk boundary lands inside a
+ * fenced code block, the earlier chunk closes the fence and the next chunk
+ * reopens it with the same language; an unclosed fence at the end of the
+ * output is closed; complete fences pass through untouched.
+ */
+
+import { describe, expect, it } from 'vitest'
+
+import { closeOpenFences, splitMarkdownAware } from '../src/stream/markdown.js'
+
+describe('closeOpenFences', () => {
+  it('leaves balanced fences untouched', () => {
+    const text = 'before\n```py\nprint(1)\n```\nafter'
+    expect(closeOpenFences(text)).toBe(text)
+  })
+
+  it('closes an unclosed fence at the end', () => {
+    const text = 'before\n```py\nprint(1)'
+    expect(closeOpenFences(text)).toBe(`${text}\n\`\`\``)
+  })
+})
+
+describe('splitMarkdownAware', () => {
+  it('passes a single chunk with balanced fences through unchanged', () => {
+    const text = `look:\n\`\`\`\ncode\n\`\`\`\ndone`
+    expect(splitMarkdownAware(text, 2_000)).toEqual([text])
+  })
+
+  it('closes the fence in the earlier chunk and reopens it in the next', () => {
+    const fence = '```'
+    const text = [
+      'intro',
+      fence,
+      ...Array.from({ length: 100 }, (_, index) => `line ${String(index)} ${'x'.repeat(20)}`),
+      fence,
+      'outro',
+    ].join('\n')
+    const chunks = splitMarkdownAware(text, 600)
+
+    expect(chunks.length).toBeGreaterThan(1)
+    // Every chunk is internally balanced: even number of fence lines.
+    for (const chunk of chunks) {
+      const fenceLines = chunk.split('\n').filter(line => line.trim() === fence).length
+      expect(fenceLines % 2).toBe(0)
+    }
+    // Reopened fences preserve the language marker.
+    const withLanguage = splitMarkdownAware(
+      ['intro', '```python', ...Array.from({ length: 100 }, (_, index) => `line ${String(index)}`), '```', 'done'].join('\n'),
+      400,
+    )
+    for (const chunk of withLanguage.slice(1)) {
+      if (chunk.includes('```')) {
+        const fenceLines = chunk.split('\n').filter(line => line.trim().startsWith('```'))
+        expect(fenceLines.length % 2).toBe(0)
+      }
+    }
+  })
+
+  it('preserves the language on reopened fences', () => {
+    const text = [
+      '```python',
+      ...Array.from({ length: 80 }, (_, index) => `print(${String(index)}) ${'y'.repeat(10)}`),
+      '```',
+    ].join('\n')
+    const chunks = splitMarkdownAware(text, 500)
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const chunk of chunks) {
+      const lines = chunk.split('\n').filter(line => line.trim().startsWith('```'))
+      // Reopen lines carry the language.
+      for (const line of lines) {
+        expect(line === '```' || line === '```python').toBe(true)
+      }
+    }
+  })
+
+  it('keeps table rows unbroken inside their chunk', () => {
+    const header = '| a | b |'
+    const rule = '|---|---|'
+    const rows = Array.from({ length: 200 }, (_, index) => `| v${String(index)} | w${String(index)} |`)
+    const text = [header, rule, ...rows].join('\n')
+    const chunks = splitMarkdownAware(text, 400)
+    expect(chunks.length).toBeGreaterThan(1)
+    // Each chunk that contains the header also contains the rule right after.
+    for (const chunk of chunks) {
+      if (chunk.includes(header)) {
+        expect(chunk).toContain(rule)
+      }
+    }
+  })
+
+  it('never emits a chunk over the limit after fence rebalancing', () => {
+    // Rebalancing adds text (a reopened fence line, a closing fence); long
+    // unbreakable fenced content used to come back over the limit.
+    const fencedBlob = '```ts\n' + 'y'.repeat(4_300) + '\n```'
+    const languageBlob = ['```python', ...Array.from({ length: 60 }, () => 'z'.repeat(120)), '```'].join('\n')
+    for (const text of [fencedBlob, languageBlob]) {
+      for (const chunk of splitMarkdownAware(text, 2_000)) {
+        expect(chunk.length).toBeLessThanOrEqual(2_000)
+      }
+    }
+    // The property holds at any limit, not just Discord's.
+    for (const chunk of splitMarkdownAware(languageBlob, 500)) {
+      expect(chunk.length).toBeLessThanOrEqual(500)
+    }
+  })
+
+  it('terminates on a pathological fence language longer than the budget', () => {
+    // PR review repro: a fence opener with a near-limit language tag plus
+    // a surrogate pair drove the re-split budget to 1 and looped forever.
+    // Run under a wall clock: the assertion is that it RETURNS at all.
+    const hostile = '```' + 'a'.repeat(120) + '\n\u{1F600}'.repeat(4)
+    // Note: a synchronous hang cannot be caught by Promise.race or test
+    // timers (the blocked loop starves both) — the splitter's progress
+    // guarantee is what this pins, by returning at all.
+    const chunks = splitMarkdownAware(hostile, 100)
+    expect(chunks.length).toBeGreaterThan(0)
+    for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(100)
+  })
+})

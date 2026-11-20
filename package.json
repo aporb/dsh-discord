@@ -1,0 +1,108 @@
+{
+  "name": "@aporb/dsh-discord",
+  "version": "0.2.2",
+  "description": "A Discord bridge for DeepSeek Harness 0.2.2 desktop: pick a conversation, follow it live in a thread. Fork of addozhang/dsh-discord.",
+  "license": "MIT",
+  "icon": "./icon.svg",
+  "type": "module",
+  "packageManager": "pnpm@11.0.8",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "locale/*.json",
+    "docs/plugin-detail.en.md",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
+    "clean": "rm -rf lib coverage",
+    "lint": "eslint . --max-warnings 0",
+    "test": "vitest run --testTimeout=20000 --hookTimeout=20000",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.3"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-client-store": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-credentials": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-settings": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-storage-domain": "0.2.2-rc.1",
+    "@eslint/js": "9.39.1",
+    "@types/node": "24.10.1",
+    "@types/react": "18.3.1",
+    "@vitest/coverage-v8": "^4.1.11",
+    "discord-digital-twin": "^0.1.1",
+    "esbuild": "0.25.9",
+    "eslint": "9.39.1",
+    "immer": "^10.2.0",
+    "react": "^19.0.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.48.1",
+    "vitest": "4.1.11"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.19.0",
+    "zod": "4.4.3"
+  },
+  "pnpm": {},
+  "keywords": [
+    "discord",
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "bot",
+    "ai-agent",
+    "claude-code",
+    "coding-agent",
+    "local-fork"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aporb/dsh-discord.git"
+  },
+  "homepage": "https://github.com/aporb/dsh-discord#readme",
+  "bugs": {
+    "url": "https://github.com/aporb/dsh-discord/issues"
+  }
+}

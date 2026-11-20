@@ -1,0 +1,317 @@
+/**
+ * The Discord card's form model tests. These target behavior only: staging,
+ * override presence, invalid drafts blocking saves, and read-back outcomes.
+ */
+
+import { describe, expect, it, vi } from 'vitest'
+
+import { DiscordCardForm } from '../src/client/card-form.js'
+import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
+
+type Listener = () => void
+
+function fakeScope(initial: Partial<ConfigFormSnapshot<Record<string, unknown>>> = {}): {
+  scope: ConfigForm<never>
+  snapshot: ConfigFormSnapshot<Record<string, unknown>>
+  listeners: Set<Listener>
+  setField: (field: string, value: unknown) => void
+  user: Record<string, unknown>
+} {
+  const listeners = new Set<Listener>()
+  const user: Record<string, unknown> = {}
+  const snapshot: ConfigFormSnapshot<Record<string, unknown>> = {
+    status: 'ready',
+    value: {},
+    base: {},
+    user,
+    revision: 1,
+    writable: true,
+    ...initial,
+  }
+  const scope = {
+    getSnapshot: () => snapshot,
+    subscribe: (listener: Listener) => {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+    set: (field: string, value: unknown) => {
+      user[field] = value
+      snapshot.value = { ...snapshot.value, [field]: value }
+      return Promise.resolve()
+    },
+    unset: (field: string) => {
+      Reflect.deleteProperty(user, field)
+      const next = { ...snapshot.value }
+      Reflect.deleteProperty(next, field)
+      snapshot.value = next
+      return Promise.resolve()
+    },
+  } as unknown as ConfigForm<never>
+  return {
+    scope,
+    snapshot,
+    listeners,
+    user,
+    setField: (field: string, value: unknown) => {
+      user[field] = value
+      snapshot.value = { ...snapshot.value, [field]: value }
+      for (const listener of listeners) listener()
+    },
+  }
+}
+
+describe('DiscordCardForm', () => {
+  it('reports the current section as unchanged and clean', () => {
+    const host = fakeScope({ value: { allowedGuildIds: ['123456789012345678'] } })
+    const form = new DiscordCardForm(host.scope)
+    const state = form.bind().getSnapshot()
+    expect(state.dirty).toBe(false)
+    expect(state.available).toBe(true)
+    expect(state.allowedGuildIds.text).toBe('123456789012345678')
+    expect(state.allowedGuildIds.overridden).toBe(false)
+  })
+
+  it('stages valid ID edits as overridden and saves them through the scope', async () => {
+    const host = fakeScope()
+    const form = new DiscordCardForm(host.scope)
+    const store = form.bind()
+    const actions = form.actions()
+
+    actions.edit('allowedGuildIds', ' 123456789012345678 \n123456789012345678\n223456789012345678 ')
+    let state = store.getSnapshot()
+    expect(state.dirty).toBe(true)
+    expect(state.invalid).toBe(false)
+    expect(state.allowedGuildIds.overridden).toBe(true)
+
+    actions.save()
+    await vi.waitFor(() => {
+      state = store.getSnapshot()
+      expect(state.saving).toBe(false)
+    })
+    expect(state.dirty).toBe(false)
+    expect(host.user.allowedGuildIds).toEqual(['123456789012345678', '223456789012345678'])
+  })
+
+  it('marks malformed drafts invalid and refuses to save them', async () => {
+    const host = fakeScope()
+    const form = new DiscordCardForm(host.scope)
+    const store = form.bind()
+    const actions = form.actions()
+
+    actions.edit('memberRoleIds', 'not-a-snowflake')
+    let state = store.getSnapshot()
+    expect(state.invalid).toBe(true)
+
+    actions.save()
+    await Promise.resolve()
+    state = store.getSnapshot()
+    expect(state.failed).toBe(false)
+    expect(host.user.memberRoleIds).toBeUndefined()
+    expect(state.dirty).toBe(true)
+  })
+
+  it('clears an override back to the composition layer on reset and save', async () => {
+    const host = fakeScope({ value: { deniedUserIds: ['123456789012345678'] } })
+    host.setField('deniedUserIds', ['123456789012345678'])
+    const form = new DiscordCardForm(host.scope)
+    const store = form.bind()
+    const actions = form.actions()
+
+    actions.resetField('deniedUserIds')
+    let state = store.getSnapshot()
+    expect(state.dirty).toBe(true)
+
+    actions.save()
+    await vi.waitFor(() => {
+      state = store.getSnapshot()
+      expect(state.saving).toBe(false)
+    })
+    expect(state.dirty).toBe(false)
+    expect(host.user.deniedUserIds).toBeUndefined()
+  })
+
+  it('keeps drafts and reports failure when the Host does not accept a write', async () => {
+    const host = fakeScope()
+    const scope = host.scope as unknown as ConfigForm<never> & {
+      set: (field: string, value: unknown) => Promise<void>
+    }
+    scope.set = vi.fn(() => {
+      return Promise.reject(new Error('rejected'))
+    })
+    const form = new DiscordCardForm(host.scope)
+    const store = form.bind()
+    const actions = form.actions()
+
+    actions.edit('allowedGuildIds', '123456789012345678')
+    actions.save()
+    let state = store.getSnapshot()
+    await vi.waitFor(() => {
+      state = store.getSnapshot()
+      expect(state.saving).toBe(false)
+    })
+    expect(state.failed).toBe(true)
+    expect(state.dirty).toBe(true)
+    expect(state.allowedGuildIds.text).toBe('123456789012345678')
+  })
+
+  // Obsolete in the English-only fork: the card no longer stages a language
+  // choice (there was one test for a valid choice and one for an invalid one).
+
+})
+
+describe('DiscordCardForm status surface (2.3)', () => {
+  const INVALID_TOKEN_VIEW = {
+    token: 'configured',
+    connection: 'invalid-token',
+    hint: 'token-rejected',
+  } as const
+
+  it('shows a published status and republishes when it changes', () => {
+    const host = fakeScope()
+    const form = new DiscordCardForm(host.scope)
+    const store = form.bind()
+
+    expect(store.getSnapshot().status).toBeUndefined()
+
+    form.setStatus(INVALID_TOKEN_VIEW)
+    let state = store.getSnapshot()
+    expect(state.status).toEqual({
+      connectionKey: 'discordStatusInvalidToken',
+      hintKey: 'discordHintTokenRejected',
+      actionable: true,
+      tokenConfigured: true,
+    })
+
+    form.setStatus({ token: 'configured', connection: 'connected' })
+    state = store.getSnapshot()
+    expect(state.status?.connectionKey).toBe('discordStatusConnected')
+    expect(state.status?.actionable).toBe(false)
+  })
+
+  it('keeps the status through saves, failures, and discards', async () => {
+    const host = fakeScope()
+    const form = new DiscordCardForm(host.scope)
+    const store = form.bind()
+    const actions = form.actions()
+
+    form.setStatus(INVALID_TOKEN_VIEW)
+    actions.edit('allowedGuildIds', '123456789012345678')
+    actions.save()
+    await vi.waitFor(() => {
+      const state = store.getSnapshot()
+      expect(state.saving).toBe(false)
+    })
+
+    const state = store.getSnapshot()
+    expect(state.status?.connectionKey).toBe('discordStatusInvalidToken')
+    expect(state.failed).toBe(false)
+
+    actions.discard()
+    expect(store.getSnapshot().status?.connectionKey).toBe('discordStatusInvalidToken')
+  })
+})
+
+describe('archive select field', () => {
+  it('stages a supported duration as a number write and clears back to the layer', async () => {
+    const host = fakeScope()
+    const form = new DiscordCardForm(host.scope)
+    const store = form.bind()
+    const actions = form.actions()
+
+    actions.edit('threadAutoArchiveMinutes', '4320')
+    let state = store.getSnapshot()
+    expect(state.dirty).toBe(true)
+    expect(state.invalid).toBe(false)
+    expect(state.threadAutoArchiveMinutes.overridden).toBe(true)
+    expect(state.threadAutoArchiveMinutes.text).toBe('4320')
+
+    actions.save()
+    await vi.waitFor(() => {
+      state = store.getSnapshot()
+      expect(state.dirty).toBe(false)
+    })
+    expect(host.user.threadAutoArchiveMinutes).toBe(4320)
+
+    // Reset stages a clear: the field re-inherits the composition layer.
+    actions.edit('threadAutoArchiveMinutes', '10080')
+    actions.resetField('threadAutoArchiveMinutes')
+    actions.save()
+    await vi.waitFor(() => {
+      state = store.getSnapshot()
+      expect(state.dirty).toBe(false)
+    })
+    expect(host.user.threadAutoArchiveMinutes).toBeUndefined()
+  })
+
+  it('marks unsupported durations invalid and refuses to save them', () => {
+    const host = fakeScope()
+    const form = new DiscordCardForm(host.scope)
+    const store = form.bind()
+    const actions = form.actions()
+
+    actions.edit('threadAutoArchiveMinutes', '999')
+    const state = store.getSnapshot()
+    expect(state.invalid).toBe(true)
+    expect(state.threadAutoArchiveMinutes.invalid).toBe(true)
+
+    actions.save()
+    expect(host.user.threadAutoArchiveMinutes).toBeUndefined()
+  })
+})
+
+describe('DiscordCardForm store binding', () => {
+  it('binds one shared store — repeated faces do not accumulate listeners', () => {
+    const host = fakeScope()
+    const form = new DiscordCardForm(host.scope)
+    const first = form.bind()
+    const second = form.bind()
+    // The slot's inject factory calls face() on every settings-dialog
+    // mount; each extra bind() used to leak a permanent publish listener
+    // plus a live store. One shared projection pump serves every face.
+    expect(second).toBe(first)
+
+    // The shared store still projects host pushes exactly once.
+    host.snapshot.value = { ...host.snapshot.value, allowedGuildIds: ['123456789012345678'] }
+    host.snapshot.revision = (host.snapshot.revision ?? 1) + 1
+    for (const listener of host.listeners) listener()
+    expect(first.getSnapshot().allowedGuildIds.text).toBe('123456789012345678')
+  })
+})
+
+describe('DiscordCardForm in-flight save staging (F1)', () => {
+  it('keeps drafts staged while the save is in flight', async () => {
+    const host = fakeScope()
+    const originalSet = host.scope.set.bind(host.scope)
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    // First write hangs until the test releases it: a save in flight over
+    // a host round trip, with a NEW draft staged in the middle.
+    let firstWrite = true
+    ;(host.scope as unknown as { set: (field: string, value: unknown) => Promise<void> }).set = (field: string, value: unknown): Promise<void> => {
+      if (!firstWrite) return originalSet(field, value).then(() => undefined)
+      firstWrite = false
+      return gate.then(() => originalSet(field, value)).then(() => undefined)
+    }
+    const form = new DiscordCardForm(host.scope)
+    const store = form.bind()
+    const actions = form.actions()
+
+    actions.edit('allowedGuildIds', '123456789012345678')
+    actions.save()
+    // The user edits ANOTHER field while the first write is in flight.
+    actions.edit('memberUserIds', '223456789012345678')
+    release()
+    await vi.waitFor(() => { expect(store.getSnapshot().saving).toBe(false) })
+
+    // The saved field landed and its draft was consumed; the mid-flight
+    // draft survives (dirty), and a follow-up save lands it too.
+    expect(host.user.allowedGuildIds).toEqual(['123456789012345678'])
+    expect(store.getSnapshot().dirty).toBe(true)
+
+    actions.save()
+    await vi.waitFor(() => { expect(store.getSnapshot().saving).toBe(false) })
+    expect(host.user.memberUserIds).toEqual(['223456789012345678'])
+    expect(store.getSnapshot().dirty).toBe(false)
+    expect(store.getSnapshot().failed).toBe(false)
+  })
+})

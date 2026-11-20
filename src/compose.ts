@@ -1,0 +1,457 @@
+/**
+ * The adapter composition root (review C1). Assembles the runtime the
+ * module-level features could not wire themselves into: bot token → Gateway
+ * → authorized ingress → business router → Discord REST / DSH host face,
+ * plus the settings-card status feed. Everything injected is a port;
+ * everything started here is torn down by the returned disposer.
+ *
+ * Fail-closed by construction: without a resolvable bot token nothing
+ * connects, and the status reports exactly that instead of pretending.
+ */
+
+import { startGateway, type GatewayDispatch, type GatewayHandle, type GatewaySocketFactory } from './gateway/gateway.js'
+import { createAuthorizedIngress } from './policy/guard.js'
+import type { AccessDecision, PolicyTable } from './policy/authorization.js'
+import type { NormalizedInboundEvent } from './gateway/ingress.js'
+import { planUnboundMention } from './features/unbound-mention.js'
+import { createComponentRegistry, type ComponentRegistry } from './discord/components.js'
+import type { AdapterStatusTracker } from './features/adapter-status.js'
+import type { ApprovalStore } from './features/approval-store.js'
+import type { QuestionStore } from './features/question-store.js'
+
+/** Discord Gateway wss endpoint (Milestone 1: fixed v10 surface). */
+export const GATEWAY_URL = 'wss://gateway.discord.gg/?v=10&encoding=json'
+
+/**
+ * The session mainline (src/features/session-mainline.ts): the orchestrator
+ * behind both message paths — bound-channel mentions create thread/session,
+ * adapter-owned thread messages queue continuations.
+ */
+export interface SessionMainlinePort {
+  admitMention(request: {
+    applicationId: string
+    guildId: string
+    channelId: string
+    messageId: string
+    authorId: string
+    workspaceId: string
+    prompt: string
+    /** Declared image attachments carried by the message (16.50). */
+    images: ReadonlyArray<{ url: string; filename: string; declaredSize: number; contentType: string }>
+    /** Declared text-file attachments (16.114); serialized into text parts. */
+    files: ReadonlyArray<{ url: string; filename: string; declaredSize: number; contentType: string }>
+  }): Promise<
+    | { outcome: 'admitted'; threadId: string; sessionId: string }
+    | { outcome: 'thread-conflict' }
+    | { outcome: 'thread-failed' }
+    | { outcome: 'session-rejected' }
+    | { outcome: 'session-unknown' }
+    | { outcome: 'prompt-rejected'; code?: string }
+    | { outcome: 'prompt-unknown' }
+    | { outcome: 'image-failed'; reason: string }
+    | { outcome: 'file-failed'; reason: string }
+  >
+  continueInThread(request: {
+    applicationId: string
+    guildId: string
+    threadId: string
+    sessionId: string
+    messageId: string
+    prompt: string
+    /** Declared image attachments carried by the message (16.50). */
+    images: ReadonlyArray<{ url: string; filename: string; declaredSize: number; contentType: string }>
+    /** Declared text-file attachments (16.114); serialized into text parts. */
+    files: ReadonlyArray<{ url: string; filename: string; declaredSize: number; contentType: string }>
+  }): Promise<
+    | { outcome: 'queued' }
+    | { outcome: 'already-submitted' }
+    | { outcome: 'conflict' }
+    | { outcome: 'rejected'; code?: string }
+    | { outcome: 'unknown' }
+    | { outcome: 'image-failed'; reason: string }
+    | { outcome: 'file-failed'; reason: string }
+  >
+}
+
+export interface BindingsProbe {
+  /** Workspace id bound to the channel, when one exists. */
+  workspaceForChannel(guildId: string, channelId: string): string | undefined
+  /** Session id owning the thread (writable binding), when one exists. */
+  sessionForThread(guildId: string, threadId: string): string | undefined
+}
+
+export interface CompositionDeps {
+  tokenProvider: () => Promise<string | undefined>
+  socketFactory: GatewaySocketFactory
+  policy: () => PolicyTable
+  /** Resolves the bot's own user id (Discord GET /users/@me) before start. */
+  selfUserIdProvider: () => Promise<string>
+  /** Gateway intent bitmask (Milestone 1 fixed set). */
+  intents: number
+  /**
+   * Gateway endpoint override (twin-E2E seam): defaults to the production
+   * wss URL. Must expose the real Gateway wire protocol, not a fake.
+   */
+  gatewayUrl?: string
+  /** Live accessor for the adapter's Discord application id (binding keys). */
+  applicationId: () => string
+  mainline: SessionMainlinePort
+  bindings: BindingsProbe
+  approvals: ApprovalStore
+  questions: QuestionStore
+  status: AdapterStatusTracker
+  /**
+   * Interaction (commands/components/modals) routing, wired by the Host
+   * composition where the typed settle port lives.
+   */
+  routeInteraction?: (event: NormalizedInboundEvent, interactionToken?: string) => void | Promise<void>
+  /**
+   * Public (non-ephemeral — ordinary messages have no ephemeral channel)
+   * bind affordance for an authorized mention in an unbound channel
+   * (session-control spec, "New task in an unbound channel"). Absent, the
+   * mention is ignored as before.
+   */
+  unboundNotice?: (request: {
+    guildId: string
+    channelId: string
+    actorId: string
+    audience: 'administrator' | 'member'
+  }) => void | Promise<void>
+  /**
+   * Fork addition: @mention in an UNBOUND channel opens a thread with the
+   * two-step conversation picker (workspace → conversation/new). The
+   * mention's text and attachments become the first prompt once a
+   * conversation is selected.
+   */
+  mentionPicker?: (request: {
+    guildId: string
+    channelId: string
+    messageId: string
+    authorId: string
+    prompt: string
+    images: ReadonlyArray<{ url: string; filename: string; declaredSize: number; contentType: string }>
+    files: ReadonlyArray<{ url: string; filename: string; declaredSize: number; contentType: string }>
+  }) => void | Promise<void>
+  /**
+   * Fork addition: @mention in a Workspace-BOUND channel attaches that
+   * Workspace's most recent conversation (thread + live render) and submits
+   * the mention text as a prompt. With no attachable conversation the
+   * handler falls back to the legacy new-session mainline internally.
+   */
+  attachMention?: (request: {
+    guildId: string
+    channelId: string
+    messageId: string
+    authorId: string
+    workspaceId: string
+    prompt: string
+    hasTask: boolean
+    images: ReadonlyArray<{ url: string; filename: string; declaredSize: number; contentType: string }>
+    files: ReadonlyArray<{ url: string; filename: string; declaredSize: number; contentType: string }>
+  }) => void | Promise<void>
+  /**
+   * Thread-visible feedback for attachments the adapter cannot carry
+   * (16.114). Without this, a binary-only message vanished with zero logs,
+   * zero replies and zero warnings — the user could not tell a drop from a
+   * hung bot. `channelId` is the thread (or channel) the message came from.
+   */
+  attachmentNotice?: (request: {
+    channelId: string
+    filenames: ReadonlyArray<string>
+  }) => void | Promise<void>
+  /**
+   * Runs once per READY: the reconciliation sweep — which also self-heals
+   * the adapter's guild surface (category, control channel, bound home
+   * channels) — and the trigger for startup mapping verification preceding
+   * accepted writes for those mappings (reconciliation spec).
+   */
+  onReady?: () => void | Promise<void>
+  /**
+   * Registry override so the composition root shares ONE registry instance
+   * across the runtime and every feature handler (question controls,
+   * approval buttons, bind confirms).
+   */
+  registry?: ComponentRegistry
+  logger?: { warn(event: string, detail?: unknown): void }
+}
+
+export interface DiscordAdapterRuntime {
+  registry: ComponentRegistry
+  approvals: ApprovalStore
+  questions: QuestionStore
+  started: boolean
+  /** Why the runtime did not start (no token ⇒ fail-closed offline). */
+  startError?: 'missing-token' | undefined
+  /**
+   * Re-run the start chain after a late credential write (the card's
+   * Connect button). Idempotent: an already-running gateway is replaced.
+   */
+  connect(): void
+  /**
+   * Operator-initiated offline. The credential stays stored; the start chain
+   * is blocked until the next connect().
+   */
+  disconnect(): void
+  dispose(): void
+}
+
+/** Business routing over one normalized, already-authorized event. */
+export function routeEvent(deps: CompositionDeps, event: NormalizedInboundEvent, decision: AccessDecision): void {
+  if (event.kind === 'message') {
+    const prompt = event.content.trim()
+    const images = event.images
+    // Text files are a third independent task carrier (16.114): a file-only
+    // message MUST reach the mainline instead of being silently dropped.
+    const files = event.files
+      .filter(file => file.textCapable)
+      .map(({ url, filename, declaredSize, contentType }) => ({ url, filename, declaredSize, contentType }))
+    const unsupported = event.files.filter(file => !file.textCapable)
+    const hasTask = prompt !== '' || images.length > 0 || files.length > 0
+
+    // An attachment we cannot carry is never allowed to disappear silently.
+    // This runs whether or not the rest of the message forms a task, so a
+    // mixed message also tells the user which files were left behind.
+    if (unsupported.length > 0) {
+      void Promise.resolve(deps.attachmentNotice?.({
+        channelId: event.channelId,
+        filenames: unsupported.map(file => file.filename),
+      })).catch((cause: unknown) => {
+        deps.logger?.warn('discord_attachment_notice_failed', { cause: String(cause) })
+      })
+    }
+
+    // Adapter-owned thread: ordinary continuation, no mention required.
+    const sessionId = deps.bindings.sessionForThread(event.guildId, event.channelId)
+    if (sessionId !== undefined) {
+      if (!hasTask) return
+      const request = {
+        applicationId: deps.applicationId(),
+        guildId: event.guildId,
+        threadId: event.channelId,
+        sessionId,
+        messageId: event.messageId,
+        prompt,
+        images,
+        files,
+      }
+      void deps.mainline.continueInThread(request)
+        .then((result) => {
+          if (result.outcome === 'rejected' || result.outcome === 'unknown' || result.outcome === 'image-failed' || result.outcome === 'file-failed') {
+            deps.logger?.warn('discord_continuation_not_queued', { ...result, messageId: event.messageId })
+          }
+        })
+        .catch((cause: unknown) => {
+          deps.logger?.warn('discord_continuation_failed', { messageId: event.messageId, cause: String(cause) })
+        })
+      return
+    }
+
+    // Mention-gated prompt flow: bindings decide admit vs ignore.
+    const workspaceId = deps.bindings.workspaceForChannel(event.guildId, event.channelId)
+    if (!event.mentionedBot) return
+    if (workspaceId === undefined) {
+      // Fork addition: the mention opens the conversation picker thread.
+      // Without that seam the legacy public bind affordance answers (the
+      // twin/E2E fixtures that predate the picker).
+      if (deps.mentionPicker !== undefined) {
+        void Promise.resolve(deps.mentionPicker({
+          guildId: event.guildId,
+          channelId: event.channelId,
+          messageId: event.messageId,
+          authorId: event.authorId,
+          prompt,
+          images,
+          files,
+        })).catch((cause: unknown) => {
+          deps.logger?.warn('discord_mention_picker_failed', { cause: String(cause) })
+        })
+        return
+      }
+      const plan = planUnboundMention({ decision, isBound: false })
+      if (plan.outcome === 'bind-affordance') {
+        void Promise.resolve(deps.unboundNotice?.({
+          guildId: event.guildId,
+          channelId: event.channelId,
+          actorId: event.authorId,
+          audience: plan.audience,
+        })).catch((cause: unknown) => {
+          deps.logger?.warn('discord_unbound_notice_failed', { cause: String(cause) })
+        })
+      }
+      return
+    }
+    // Fork addition: a bound-channel mention attaches the Workspace's most
+    // recent conversation instead of always creating a new Session. The
+    // handler owns the fallback, including the mention-without-task case.
+    if (deps.attachMention !== undefined) {
+      void Promise.resolve(deps.attachMention({
+        guildId: event.guildId,
+        channelId: event.channelId,
+        messageId: event.messageId,
+        authorId: event.authorId,
+        workspaceId,
+        prompt,
+        hasTask,
+        images,
+        files,
+      })).catch((cause: unknown) => {
+        deps.logger?.warn('discord_attach_mention_failed', { cause: String(cause) })
+      })
+      return
+    }
+    if (!hasTask) return
+    void deps.mainline.admitMention({
+      applicationId: deps.applicationId(),
+      guildId: event.guildId,
+      channelId: event.channelId,
+      messageId: event.messageId,
+      authorId: event.authorId,
+      workspaceId,
+      prompt,
+      images,
+      files,
+    })
+      .then((result) => {
+        if (result.outcome !== 'admitted') {
+          deps.logger?.warn('discord_mention_not_admitted', { result, messageId: event.messageId })
+        }
+      })
+      .catch((cause: unknown) => {
+        deps.logger?.warn('discord_mention_admit_failed', { messageId: event.messageId, cause: String(cause) })
+      })
+    return
+  }
+  // Interactions are dispatched ONLY from handleDispatch (which owns the
+  // interaction token); no token-less forwarding here (double-call bug).
+}
+
+/**
+ * Start the composed adapter runtime. The returned runtime is live after the
+ * token resolves; `started` flips once the Gateway has been spawned.
+ */
+export function startDiscordAdapter(deps: CompositionDeps): DiscordAdapterRuntime {
+  const registry = deps.registry ?? createComponentRegistry()
+  const status = deps.status
+
+  let gateway: GatewayHandle | undefined
+  let started = false
+  let startError: 'missing-token' | undefined
+  let ingress: {
+    accept(dispatch: GatewayDispatch): { accepted: boolean; event?: NormalizedInboundEvent; reason?: string; response?: 'silent' | 'ephemeral-denial' }
+  } | undefined
+
+  function handleDispatch(dispatch: GatewayDispatch): void {
+    if (dispatch.t === 'READY') status.setGateway('connected')
+    const accepted = ingress?.accept(dispatch)
+    if (accepted?.accepted === false && (dispatch.t === 'INTERACTION_CREATE' || dispatch.t === 'MESSAGE_CREATE')) {
+      // A user-driven dispatch that dies at the gate must not vanish: from
+      // the user's side the click "does nothing", so the gate reason is on
+      // the record. Unrelated dispatch noise stays unlogged.
+      deps.logger?.warn('discord_dispatch_rejected', { type: dispatch.t, reason: accepted.reason })
+    }
+    if (accepted?.accepted === true && accepted.event !== undefined && accepted.event.kind === 'interaction') {
+      const d = dispatch.d as Record<string, unknown> | undefined
+      const token = typeof d?.['token'] === 'string' ? d['token'] : undefined
+      void Promise.resolve(deps.routeInteraction?.(accepted.event, token)).catch((cause: unknown) => {
+        console.error('[dsh-discord] interaction handler failed:', cause)
+      })
+    }
+    if (dispatch.t === 'READY' && deps.onReady !== undefined) {
+      void Promise.resolve(deps.onReady()).catch((cause: unknown) => {
+        deps.logger?.warn('discord_ready_reconcile_failed', String(cause))
+      })
+    }
+  }
+
+  /** Set while the operator explicitly disconnected; blocks auto start. */
+  let stoppedByUser = false
+  /**
+   * Start-chain generation. Bumped by connect()/disconnect() so an in-flight
+   * chain (suspended at its token/identity awaits) dies quietly instead of
+   * spawning a second, unownable gateway after the operator acted.
+   */
+  let startSeq = 0
+
+  async function runStartChain(): Promise<void> {
+    const seq = ++startSeq
+    const stale = (): boolean => stoppedByUser || seq !== startSeq
+    if (stale()) return
+    const token = await deps.tokenProvider()
+    if (stale()) return
+    if (token === undefined || token === '') {
+      started = false
+      startError = 'missing-token'
+      status.setCredential({ configured: false })
+      status.setGateway('disconnected')
+      return
+    }
+    status.setCredential({ configured: true })
+    const selfUserId = await deps.selfUserIdProvider()
+    if (stale()) return
+
+    ingress = createAuthorizedIngress({
+      selfUserId,
+      policy: deps.policy,
+      onEvent: (event, decision) => { routeEvent(deps, event, decision) },
+    })
+
+    gateway = startGateway({
+      url: deps.gatewayUrl ?? GATEWAY_URL,
+      tokenProvider: () => deps.tokenProvider().then((value) => {
+        if (value === undefined) throw new TypeError('discord bot token unavailable')
+        return value
+      }),
+      intents: deps.intents,
+      socketFactory: deps.socketFactory,
+      onDispatch: handleDispatch,
+      onTerminalClose: (code) => {
+        status.setGateway({ kind: 'terminal-close', code })
+      },
+      onBackoffScheduled: () => {
+        status.setGateway('connecting')
+      },
+    })
+    started = true
+    status.setGateway('connecting')
+  }
+
+  void runStartChain().catch((cause: unknown) => {
+    deps.logger?.warn('discord_adapter_start_failed', String(cause))
+    status.setGateway('disconnected')
+  })
+
+  return {
+    registry,
+    approvals: deps.approvals,
+    questions: deps.questions,
+    get started() { return started },
+    get startError() { return startError },
+    connect() {
+      stoppedByUser = false
+      startError = undefined
+      startSeq += 1
+      gateway?.dispose()
+      gateway = undefined
+      started = false
+      void runStartChain().catch((cause: unknown) => {
+        deps.logger?.warn('discord_adapter_connect_failed', String(cause))
+        status.setGateway('disconnected')
+      })
+    },
+    disconnect() {
+      // Operator-initiated offline: the credential stays in the store so the
+      // next Connect (possibly with a replaced token) needs no re-entry.
+      stoppedByUser = true
+      startSeq += 1
+      gateway?.dispose()
+      gateway = undefined
+      started = false
+      startError = undefined
+      status.setGateway('disconnected')
+    },
+    dispose() {
+      startSeq += 1
+      gateway?.dispose()
+    },
+  }
+}

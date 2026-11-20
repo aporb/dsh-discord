@@ -1,0 +1,416 @@
+/**
+ * Normalized inbound Gateway events. Every Discord dispatch this module
+ * accepts is untrusted wire data: validation failures are values, never
+ * throws, so one malformed payload can never break the dispatch loop. Only
+ * guild-scoped events the adapter understands survive this boundary; DMs and
+ * foreign event shapes are rejected here, before any business logic runs.
+ */
+
+/** Numeric string of 17-20 digits, the Discord snowflake wire shape. */
+const SNOWFLAKE = /^\d{17,20}$/u
+
+/** A Discord snowflake-shaped string. */
+export type DiscordSnowflake = string
+
+/** Validate the snowflake shape of an untrusted string. */
+export function isDiscordSnowflake(value: unknown): value is DiscordSnowflake {
+  return typeof value === 'string' && SNOWFLAKE.test(value)
+}
+
+/** Gateway dispatch event names the adapter consumes; everything else is rejected. */
+const SUPPORTED_EVENTS = new Set(['MESSAGE_CREATE', 'INTERACTION_CREATE'])
+
+/** Interaction types the adapter consumes (2=command, 3=component, 4=autocomplete, 5=modal). */
+const SUPPORTED_INTERACTION_TYPES = new Set([2, 3, 4, 5])
+
+/**
+ * Discord's "basic messages": the only message types a member can actually
+ * author. Every other type is a channel/thread metadata event (renames, pin
+ * notices, join notices, boost tiers, AutoMod actions, …) that Discord still
+ * posts as a MESSAGE_CREATE with a non-empty `content` and a human-looking
+ * `author`. Compare Discord's Message Types table at
+ * https://docs.discord.com/developers/resources/message — 0 DEFAULT,
+ * 19 REPLY, 20 CHAT_INPUT_COMMAND, 23 CONTEXT_MENU_COMMAND.
+ */
+const USER_MESSAGE_TYPES: ReadonlySet<number> = new Set([0, 19, 20, 23])
+
+/** Raw untrusted dispatch: an event name plus its unvalidated payload. */
+export interface GatewayDispatch {
+  t: string
+  d?: unknown
+}
+
+/** Why a dispatch was rejected; discrimination keeps rejection handling total. */
+export type IngestRejectReason =
+  | 'unsupported-event'
+  | 'malformed-payload'
+  | 'bot-authored'
+  | 'non-guild-event'
+  | 'system-message'
+
+export type IngestResult =
+  | { accepted: true; event: NormalizedMessage | NormalizedInteraction }
+  | { accepted: false; reason: IngestRejectReason }
+/** A validated guild message with its mention-stripped content. */
+export interface NormalizedMessage {
+  kind: 'message'
+  messageId: DiscordSnowflake
+  guildId: DiscordSnowflake
+  channelId: DiscordSnowflake
+  authorId: DiscordSnowflake
+  /** Role ids the wire attached to the member (empty when absent). */
+  roleIds: string[]
+  /** Permission bitmask string from the member, when the wire carried one. */
+  memberPermissions: string | undefined
+  /** Content after stripping every bot-mention token and trimming. */
+  content: string
+  /** Whether the message explicitly mentioned the adapter's bot user. */
+  mentionedBot: boolean
+  /** The snowflake of the message this one replies to, when present and valid. */
+  repliedToId: DiscordSnowflake | undefined
+  /**
+   * DECLARED image-attachment metadata (16.50): supported types only,
+   * malformed entries skipped, capped at Discord's per-message limit. No
+   * bytes cross this boundary — download happens later, behind the
+   * allowlisted fetch boundary.
+   */
+  images: DiscordImageAttachment[]
+  /**
+   * DECLARED non-image attachments (16.114). Every attachment that is not a
+   * supported image survives here with a `textCapable` flag: text files are
+   * downloaded and serialized into prompt text parts, while binary files are
+   * only ever used to explain to the user why they were not delivered.
+   */
+  files: DiscordFileAttachment[]
+}
+
+/** One supported image attachment, as declared by the wire. */
+export interface DiscordImageAttachment {
+  url: string
+  filename: string
+  declaredSize: number
+  contentType: string
+}
+
+/** One non-image attachment, as declared by the wire. */
+export interface DiscordFileAttachment {
+  url: string
+  filename: string
+  declaredSize: number
+  contentType: string
+  /** Whether the declared media type is safe to decode as UTF-8 text. */
+  textCapable: boolean
+}
+
+/** A validated guild interaction with its actor identity. */
+export interface NormalizedInteraction {
+  kind: 'interaction'
+  interactionId: DiscordSnowflake
+  /** Discord interaction type (2=command, 3=component, 4=autocomplete, 5=modal). */
+  interactionType: number
+  guildId: DiscordSnowflake
+  channelId: DiscordSnowflake
+  actorId: DiscordSnowflake
+  roleIds: string[]
+  /** Permission bitmask string from the member, when the wire carried one. */
+  memberPermissions: string | undefined
+  /** The component interaction's parent message (control editing). */
+  componentMessageId: string | undefined
+  /** Select-menu values (string selects only). */
+  selectValues: string[]
+  /** Modal text fields, flattened from the action rows (custom_id + value). */
+  modalFields: Array<{ customId: string; value: string }>
+  /** Whether the invoking user is itself a bot; such invocations are denied. */
+  isBot: boolean
+  /** Slash-command name for command/autocomplete interactions, when present. */
+  commandName: string | undefined
+  /** The opaque interaction data table, normalized for downstream routing. */
+  data: Record<string, unknown>
+}
+
+/**
+ * Detect and strip the adapter's own mention (`<@id>` or `<@!id>`) from
+ * message content. Other users' mentions are left intact; a mention-only
+ * message yields empty text.
+ */
+export function extractBotMention(
+  content: string,
+  selfUserId: DiscordSnowflake,
+): { mentioned: boolean; text: string } {
+  const pattern = new RegExp(`<@!?${selfUserId}>`, 'gu')
+  const mentioned = pattern.test(content)
+  if (!mentioned) return { mentioned: false, text: content }
+  return { mentioned: true, text: content.replace(pattern, ' ').trim() }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Extract the member's role ids; server-provided, so lenient when absent. */
+function extractRoleIds(payload: Record<string, unknown>): string[] {
+  const member = payload['member']
+  if (!isRecord(member) || !Array.isArray(member['roles'])) return []
+  return member['roles'].filter((role): role is string => typeof role === 'string')
+}
+
+function asSnowflake(value: unknown): DiscordSnowflake | undefined {
+  return isDiscordSnowflake(value) ? value : undefined
+}
+
+/** Image content types the adapter carries (design.md §12). */
+const SUPPORTED_IMAGE_TYPES: ReadonlySet<string> = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+])
+
+/**
+ * Non-image media types whose bytes are meaningful as UTF-8 text (16.114).
+ * Discord often appends parameters (`text/plain; charset=utf-8`), so the
+ * comparison always runs on the normalized base type.
+ */
+const TEXT_CAPABLE_TYPES: ReadonlySet<string> = new Set([
+  'application/json',
+  'application/ld+json',
+  'application/x-ndjson',
+  'application/xml',
+  'application/yaml',
+  'application/x-yaml',
+  'application/javascript',
+  'application/typescript',
+  'application/sql',
+  'application/graphql',
+  'application/toml',
+])
+
+/** Discord's per-message attachment cap; a defensive bound on untrusted input. */
+const MAX_MESSAGE_IMAGES = 10
+const MAX_MESSAGE_FILES = 10
+
+/** Strip media-type parameters and case (`text/plain; charset=utf-8` → `text/plain`). */
+export function normalizeMediaType(contentType: string): string {
+  return contentType.split(';')[0]?.trim().toLowerCase() ?? ''
+}
+
+/** Whether a declared media type is carried as a downloadable text file. */
+export function isTextCapableMediaType(contentType: string): boolean {
+  const normalized = normalizeMediaType(contentType)
+  return normalized.startsWith('text/') || TEXT_CAPABLE_TYPES.has(normalized)
+}
+
+/**
+ * Narrow untrusted `attachments` onto declared image metadata. Entries that
+ * are not records, lack any required field, or declare an unsupported media
+ * type are skipped — a malformed attachment never rejects the message.
+ */
+function extractImages(payload: Record<string, unknown>): DiscordImageAttachment[] {
+  const raw = payload['attachments']
+  if (!Array.isArray(raw)) return []
+  const images: DiscordImageAttachment[] = []
+  for (const entry of raw) {
+    if (images.length >= MAX_MESSAGE_IMAGES) break
+    if (!isRecord(entry)) continue
+    const url = entry['url']
+    const filename = entry['filename']
+    const size = entry['size']
+    const contentType = entry['content_type']
+    if (typeof url !== 'string' || url === '') continue
+    if (typeof filename !== 'string' || filename === '') continue
+    if (typeof size !== 'number' || !Number.isFinite(size) || size < 0) continue
+    if (typeof contentType !== 'string' || !SUPPORTED_IMAGE_TYPES.has(normalizeMediaType(contentType))) continue
+    images.push({ url, filename, declaredSize: size, contentType })
+  }
+  return images
+}
+
+/**
+ * Narrow untrusted `attachments` onto declared NON-IMAGE file metadata
+ * (16.114). Unlike `extractImages`, nothing is silently dropped here: an
+ * unsupported binary type is still carried with `textCapable: false`, so the
+ * routing layer can tell the user why the file did not reach DSH.
+ */
+function extractFiles(payload: Record<string, unknown>): DiscordFileAttachment[] {
+  const raw = payload['attachments']
+  if (!Array.isArray(raw)) return []
+  const files: DiscordFileAttachment[] = []
+  for (const entry of raw) {
+    if (files.length >= MAX_MESSAGE_FILES) break
+    if (!isRecord(entry)) continue
+    const url = entry['url']
+    const filename = entry['filename']
+    const size = entry['size']
+    const contentType = entry['content_type']
+    if (typeof url !== 'string' || url === '') continue
+    if (typeof filename !== 'string' || filename === '') continue
+    if (typeof size !== 'number' || !Number.isFinite(size) || size < 0) continue
+    if (typeof contentType !== 'string' || normalizeMediaType(contentType) === '') continue
+    if (SUPPORTED_IMAGE_TYPES.has(normalizeMediaType(contentType))) continue
+    files.push({ url, filename, declaredSize: size, contentType, textCapable: isTextCapableMediaType(contentType) })
+  }
+  return files
+}
+
+function parseMessage(payload: Record<string, unknown>, selfUserId: DiscordSnowflake): IngestResult {
+  // Discord system messages are channel metadata events, not member input.
+  // They carry `content` and a human `author`, so none of the guards below can
+  // catch them — a bound thread would otherwise submit a thread rename as a
+  // prompt (issue #17). A missing `type` stays acceptable for the internal
+  // fixtures/twin; Discord always sends the field on the real wire.
+  const messageType = payload['type']
+  if (messageType !== undefined) {
+    if (typeof messageType !== 'number') return { accepted: false, reason: 'malformed-payload' }
+    if (!USER_MESSAGE_TYPES.has(messageType)) return { accepted: false, reason: 'system-message' }
+  }
+
+  // Webhook-authored messages are app-driven surfaces, not member input:
+  // their author object need not carry `bot: true`, and anyone with
+  // Manage Webhooks could otherwise drive prompts through one.
+  if (typeof payload['webhook_id'] === 'string') return { accepted: false, reason: 'bot-authored' }
+
+  const author = payload['author']
+  if (!isRecord(author)) return { accepted: false, reason: 'malformed-payload' }
+
+  const authorId = asSnowflake(author['id'])
+  if (authorId === undefined) return { accepted: false, reason: 'malformed-payload' }
+  if (author['bot'] === true || authorId === selfUserId) {
+    return { accepted: false, reason: 'bot-authored' }
+  }
+
+  const messageId = asSnowflake(payload['id'])
+  const guildId = asSnowflake(payload['guild_id'])
+  const channelId = asSnowflake(payload['channel_id'])
+  if (messageId === undefined || channelId === undefined) {
+    return { accepted: false, reason: 'malformed-payload' }
+  }
+  // A message outside a guild is a DM or foreign surface: reject at the
+  // earliest boundary so it can never reach authorization or DSH.
+  if (guildId === undefined) return { accepted: false, reason: 'non-guild-event' }
+
+  const content = typeof payload['content'] === 'string' ? payload['content'] : undefined
+  if (content === undefined) return { accepted: false, reason: 'malformed-payload' }
+
+  const reference = payload['message_reference']
+  const repliedToId = isRecord(reference) ? asSnowflake(reference['message_id']) : undefined
+  if (reference !== undefined && !isRecord(reference)) {
+    return { accepted: false, reason: 'malformed-payload' }
+  }
+  if (isRecord(reference) && reference['message_id'] !== undefined && repliedToId === undefined) {
+    return { accepted: false, reason: 'malformed-payload' }
+  }
+
+  const stripped = extractBotMention(content, selfUserId)
+  const rawPermissions = typeof (isRecord(payload['member']) ? payload['member'] : {})['permissions'] === 'string'
+    ? (payload['member'] as { permissions: string }).permissions
+    : undefined
+  return {
+    accepted: true,
+    event: {
+      kind: 'message',
+      messageId,
+      guildId,
+      channelId,
+      authorId,
+      roleIds: extractRoleIds(payload),
+      memberPermissions: rawPermissions,
+      content: stripped.text,
+      mentionedBot: stripped.mentioned,
+      repliedToId,
+      images: extractImages(payload),
+      files: extractFiles(payload),
+    },
+  }
+}
+
+function parseInteraction(payload: Record<string, unknown>): IngestResult {
+  const interactionType = payload['type']
+  if (typeof interactionType !== 'number' || !SUPPORTED_INTERACTION_TYPES.has(interactionType)) {
+    return { accepted: false, reason: 'unsupported-event' }
+  }
+
+  const interactionId = asSnowflake(payload['id'])
+  const guildId = asSnowflake(payload['guild_id'])
+  const channelId = asSnowflake(payload['channel_id'])
+  if (interactionId === undefined || guildId === undefined || channelId === undefined) {
+    return { accepted: false, reason: 'malformed-payload' }
+  }
+
+  const member = payload['member']
+  const user = payload['user']
+  const authorId = isRecord(member)
+    ? (isRecord(member['user']) ? asSnowflake(member['user']['id']) : undefined)
+    : isRecord(user)
+      ? asSnowflake(user['id'])
+      : undefined
+  if (authorId === undefined) return { accepted: false, reason: 'malformed-payload' }
+
+  const data = payload['data']
+  if (data !== undefined && !isRecord(data)) return { accepted: false, reason: 'malformed-payload' }
+  const table = isRecord(data) ? data : undefined
+  const commandName = typeof table?.['name'] === 'string' ? table['name'] : undefined
+  if ((interactionType === 2 || interactionType === 4) && commandName === undefined) {
+    return { accepted: false, reason: 'malformed-payload' }
+  }
+
+  const memberUser = isRecord(member) && isRecord(member['user']) ? member['user'] : undefined
+  const wireUser = isRecord(user) ? user : undefined
+  const rawPermissions = isRecord(member) && typeof member['permissions'] === 'string'
+    ? member['permissions']
+    : undefined
+
+  // Component parent message + select values + modal fields (the question
+  // and approval flows need all three; absent for commands/autocomplete).
+  const wireMessage = payload['message']
+  const componentMessageId = isRecord(wireMessage) ? asSnowflake(wireMessage['id']) : undefined
+  const selectValues = isRecord(data) && Array.isArray(data['values'])
+    ? data['values'].filter((value): value is string => typeof value === 'string')
+    : []
+  const modalRows = isRecord(data) && Array.isArray(data['components']) ? data['components'] : []
+  const modalFields: Array<{ customId: string; value: string }> = []
+  for (const row of modalRows) {
+    if (!isRecord(row) || !Array.isArray(row['components'])) continue
+    for (const field of row['components']) {
+      if (!isRecord(field)) continue
+      if (typeof field['custom_id'] === 'string' && typeof field['value'] === 'string') {
+        modalFields.push({ customId: field['custom_id'], value: field['value'] })
+      }
+    }
+  }
+
+  return {
+    accepted: true,
+    event: {
+      kind: 'interaction',
+      interactionId,
+      interactionType,
+      guildId,
+      channelId,
+      actorId: authorId,
+      roleIds: extractRoleIds(payload),
+      memberPermissions: rawPermissions,
+      isBot: (memberUser?.['bot'] ?? wireUser?.['bot']) === true,
+      commandName,
+      data: table ?? {},
+      componentMessageId,
+      selectValues,
+      modalFields,
+    },
+  }
+}
+
+/**
+ * Validate and normalize one untrusted Gateway dispatch. Returns a rejection
+ * value for every unsupported or malformed input and never throws.
+ */
+export function parseGatewayDispatch(dispatch: GatewayDispatch, selfUserId: DiscordSnowflake): IngestResult {
+  if (!isRecord(dispatch) || typeof dispatch['t'] !== 'string' || !SUPPORTED_EVENTS.has(dispatch['t'])) {
+    return { accepted: false, reason: 'unsupported-event' }
+  }
+  const payload = dispatch['d']
+  if (!isRecord(payload)) return { accepted: false, reason: 'malformed-payload' }
+
+  return dispatch['t'] === 'MESSAGE_CREATE'
+    ? parseMessage(payload, selfUserId)
+    : parseInteraction(payload)
+}

@@ -1,0 +1,17 @@
+# Bundle patch for the local Discord bridge fork: mounts the embedded Discord
+# adapter into the Web profile's Host plugin tree. The row injects every
+# required DSH service, so activation waits until the Host provides them; the
+# plugin's own startup validation fails loud when a dependency is present but
+# incompatible.
+#
+# The browser half is declared through this package's `dsh.client` manifest,
+# so the modules node half scans it into the browser roster automatically and
+# no client row is needed here.
+#
+# The row id stays `dsh-discord`: it is also the settings namespace, so
+# existing settings documents and the adapter's storage bindings remain valid.
+
+- insert:
+    - id: dsh-discord
+      name: '@aporb/dsh-discord'
+      inject: [sessionController, workspaceController, sessionQuery, webServer, credentials, settings, storageDomain, connection, commands, permissionPresets]

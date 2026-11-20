@@ -1,0 +1,2362 @@
+/**
+ * Twin smoke (E2E seam, silent-failure-is-a-bug discipline): the REAL gateway client and REAL
+ * REST client run against a local Discord API twin — the same wire protocol —
+ * while DSH stays a deterministic fake. Only Discord-visible state is
+ * asserted (threads, messages); internal logging is never asserted.
+ *
+ * The message mainline and the interaction surface (bind / stop / steer)
+ * are both smoke-driven end to end over the twin.
+ */
+
+import { DigitalDiscord } from 'discord-digital-twin'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+
+import { createInteractionRouter } from '../src/features/interaction-router.js'
+import { createCopy } from '../src/i18n.js'
+import { renderApprovalControls } from '../src/features/approval-view.js'
+import { createApprovalStore } from '../src/features/approval-store.js'
+import { createComponentRegistry } from '../src/discord/components.js'
+import { startLiveRender } from '../src/stream/live.js'
+import { CUSTOM_ANSWER_VALUE, renderQuestionControls } from '../src/features/question-view.js'
+import { handleRemoteResolution } from '../src/features/question-routing.js'
+import { handleSelectInput, handleModalSubmit } from '../src/features/question-routing.js'
+import { startDiscordAdapter, type DiscordAdapterRuntime } from '../src/compose.js'
+import { createSharedRestClient, type SharedRestClient } from '../src/discord/rest.js'
+import { createRestThreadPort } from '../src/discord/thread-port.js'
+import { createSessionMainline } from '../src/features/session-mainline.js'
+import { createThreadCreationFlow, type DiscordThreadPort } from '../src/features/thread-creation.js'
+import { createSessionCreationFlow, type DshSessionPort } from '../src/features/session-creation.js'
+import { createPromptSubmissionFlow, type DshPromptPort } from '../src/features/prompt-submission.js'
+import { createTurnTracker } from '../src/features/turn-ownership.js'
+import { createAdapterStatusTracker } from '../src/features/adapter-status.js'
+import { createQuestionStore } from '../src/features/question-store.js'
+import { channelBindingKey, threadBindingKey, parseChannelBindingKey, parseThreadBindingKey } from '../src/state/domain.js'
+import { createBindingStore } from '../src/state/bindings.js'
+import { createIntentStore } from '../src/state/intents.js'
+import { createKvTableStub } from './helpers/kv-table.js'
+import type { ChannelBinding, ThreadBinding } from '../src/state/records.js'
+import type { GatewaySocket } from '../src/gateway/gateway.js'
+
+const BOT = '111111111111111111'
+const USER = '222222222222222222'
+const GUILD = '333333333333333333'
+const CHANNEL = '444444444444444444'
+const FREE_CHANNEL = '444444444444444445'
+
+/** Translate the browser-style WebSocket events onto the adapter contract. */
+function twinSocket(url: string): GatewaySocket {
+  const ws = new WebSocket(url)
+  const socket: GatewaySocket = {
+    url,
+    onopen: null,
+    onmessage: null,
+    onclose: null,
+    onerror: null,
+    close: (code?: number) => { ws.close(code ?? 1000) },
+    terminate: () => { ws.close(1000) },
+    send: (data: string) => { ws.send(data) },
+  }
+  ws.addEventListener('open', () => { socket.onopen?.() })
+  ws.addEventListener('message', (event) => {
+    socket.onmessage?.(typeof event.data === 'string' ? event.data : String(event.data))
+  })
+  ws.addEventListener('close', (event) => { socket.onclose?.(event.code) })
+  ws.addEventListener('error', () => { socket.onerror?.(new Error('socket error')) })
+  return socket
+}
+
+describe('twin smoke: mention mainline over the real wire', () => {
+  let discord: DigitalDiscord
+  let rest: SharedRestClient
+  let runtime: DiscordAdapterRuntime
+  const promptCalls: Array<{ requestId: string; sessionId: string; prompt: string; mode: string }> = []
+  const threadRows = new Map<string, ThreadBinding>()
+  const rowMap = new Map<string, ChannelBinding>()
+
+  beforeAll(async () => {
+    discord = new DigitalDiscord({
+      botToken: 'twin-test-token',
+      botUser: { id: BOT, username: 'dsh' },
+      guild: { id: GUILD, name: 'Twin Guild' },
+      channels: [{ id: CHANNEL, name: 'tmp', type: 0 }], // GuildText
+      users: [{ id: USER, username: 'Addo' }],
+    })
+    await discord.start()
+    rest = createSharedRestClient({ token: discord.botToken, apiBase: `${discord.restUrl}/v10` })
+
+    // The composed session mainline: real Discord ports over the twin, DSH
+    // deterministic (accepted outcomes), stores process-local.
+    const intents = createIntentStore(createKvTableStub())
+    const threadBindings = createBindingStore<ThreadBinding>({
+      get: key => threadRows.get(key),
+      put: (key, record) => { threadRows.set(key, record); return Promise.resolve() },
+      delete: key => Promise.resolve(threadRows.delete(key)),
+    })
+    rowMap.set(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: CHANNEL }), {
+      workspaceId: 'ws-1', revision: 1, boundBy: USER, boundAtMs: 1,
+    })
+    const threadPort: DiscordThreadPort = createRestThreadPort({
+      request: async (method, path, body) => rest.request(method, path, body),
+    }, { autoArchiveMinutes: () => 1440 })
+    const sessions: DshSessionPort = {
+      createSession: request => Promise.resolve({ outcome: 'completed', sessionId: request.sessionId }),
+    }
+    const prompts: DshPromptPort = {
+      submit: request => {
+        promptCalls.push(request)
+        return Promise.resolve({ outcome: 'accepted' })
+      },
+    }
+    /** Deterministic collector: proves declared wire metadata reached the flow. */
+    const images = {
+      collect: (request: { attachments: ReadonlyArray<unknown> }) => Promise.resolve({
+        outcome: 'collected' as const,
+        images: request.attachments.map((_attachment, index) => ({ mediaType: 'image/png', base64: `img-${String(index)}` })),
+      }),
+    }
+    /** No network in the twin: text files are collected deterministically. */
+    const files = {
+      collect: (request: { attachments: ReadonlyArray<unknown> }) => Promise.resolve({
+        outcome: 'collected' as const,
+        texts: request.attachments.map((_attachment, index) => `file-text-${String(index)}`),
+      }),
+    }
+    const mainline = createSessionMainline({
+      threads: createThreadCreationFlow({ intents, discord: threadPort, nowMs: () => Date.now() }),
+      sessions: createSessionCreationFlow({
+        sessions,
+        threadBindings,
+        newSessionId: () => 'sess-twin-1',
+      }),
+      prompts: createPromptSubmissionFlow({ prompts, intents, nowMs: () => Date.now() }),
+      turns: createTurnTracker(),
+      images,
+      files,
+    })
+
+    runtime = startDiscordAdapter({
+      tokenProvider: () => Promise.resolve(discord.botToken),
+      socketFactory: twinSocket,
+      policy: () => ({
+        allowedGuildIds: [GUILD],
+        memberUserIds: [USER],
+        memberRoleIds: [],
+        administratorUserIds: [],
+        administratorRoleIds: [],
+        deniedUserIds: [],
+        deniedRoleIds: [],
+        hostOperatorUserIds: [],
+      }),
+      selfUserIdProvider: () => Promise.resolve(BOT),
+      intents: (1 << 0) | (1 << 9) | (1 << 15),
+      applicationId: () => BOT,
+      mainline,
+      gatewayUrl: `${discord.gatewayUrl}?v=10&encoding=json`,
+      bindings: {
+        workspaceForChannel: (guildId, cid) =>
+          rowMap.get(channelBindingKey({ applicationId: BOT, guildId, channelId: cid }))?.workspaceId,
+        sessionForThread: (guildId, threadId) =>
+          threadRows.get(threadBindingKey({ applicationId: BOT, guildId, threadId }))?.sessionId,
+      },
+      approvals: createApprovalStore({ get: () => undefined, put: async () => {} }),
+      questions: createQuestionStore(),
+      status: createAdapterStatusTracker(),
+    })
+    // Wait for the twin's READY: our gateway has identified and received
+    // GUILD_CREATE before any user simulation is meaningful.
+    await new Promise(resolve => { setTimeout(resolve, 500) })
+  }, 20_000)
+
+  afterAll(async () => {
+    runtime.dispose()
+    await discord.stop()
+  })
+
+  it('admits a mention into an anchored thread and submits exactly one prompt', async () => {
+    const source = await discord.channel(CHANNEL).user(USER).sendMessage({
+      content: `<@${BOT}> hello world`,
+    })
+
+    const scope = discord.channel(CHANNEL)
+    const thread = await scope.waitForThread({
+      timeout: 10_000,
+      predicate: t => t.name === 'hello world',
+    })
+
+    // The task message anchors the thread as its first post.
+    const threadScope = discord.thread(thread.id)
+    const messages = await threadScope.getMessages()
+    expect(messages.at(-1)?.id).toBe(source.id)
+
+    // The durable binding and the at-most-once prompt both landed. Wait on
+    // the prompt: the binding commits before the DSH call in the flow.
+    await vi.waitFor(() => { expect(promptCalls).toHaveLength(1) })
+    expect(threadRows.get(threadBindingKey({ applicationId: BOT, guildId: GUILD, threadId: thread.id }))?.sessionId)
+      .toBe('sess-twin-1')
+    expect(promptCalls[0]).toEqual({
+      requestId: `discord:${source.id}`,
+      sessionId: 'sess-twin-1',
+      prompt: 'hello world',
+      mode: 'queue',
+    })
+  }, 20_000)
+
+  it('queues a follow-up posted inside the thread without a mention', async () => {
+    const scope = discord.channel(CHANNEL)
+    const thread = await scope.waitForThread({ timeout: 10_000, predicate: t => t.name === 'hello world' })
+
+    await discord.thread(thread.id).user(USER).sendMessage({ content: 'also check the logs' })
+    // The continuation rides the same at-most-once flow on a new intent.
+    await vi.waitFor(() => { expect(promptCalls).toHaveLength(2) })
+    expect(promptCalls[1]).toMatchObject({
+      sessionId: 'sess-twin-1',
+      prompt: 'also check the logs',
+      mode: 'queue',
+    })
+    expect(promptCalls[1]?.requestId).not.toBe(promptCalls[0]?.requestId)
+  }, 20_000)
+
+  it('carries a message attachment through the wire into the prompt as image parts (16.50)', async () => {
+    const scope = discord.channel(CHANNEL)
+    const thread = await scope.waitForThread({ timeout: 10_000, predicate: t => t.name === 'hello world' })
+
+    await discord.thread(thread.id).user(USER).sendMessage({
+      content: 'and what is in this picture?',
+      attachments: [{
+        id: '999999999999999999',
+        filename: 'chart.png',
+        content_type: 'image/png',
+        size: 2048,
+        url: 'https://cdn.discordapp.com/attachments/1/2/chart.png?ex=abc',
+      } as never],
+    })
+    await vi.waitFor(() => { expect(promptCalls).toHaveLength(3) })
+    expect(promptCalls[2]).toMatchObject({
+      sessionId: 'sess-twin-1',
+      prompt: 'and what is in this picture?',
+      mode: 'queue',
+      images: [{ mediaType: 'image/png', base64: 'img-0' }],
+    })
+  }, 20_000)
+
+  it('carries a text file through the wire into the prompt as text parts (16.114)', async () => {
+    const scope = discord.channel(CHANNEL)
+    const thread = await scope.waitForThread({ timeout: 10_000, predicate: t => t.name === 'hello world' })
+
+    await discord.thread(thread.id).user(USER).sendMessage({
+      content: 'read the attached notes',
+      attachments: [{
+        id: '999999999999999998',
+        filename: 'notes.txt',
+        content_type: 'text/plain; charset=utf-8',
+        size: 249,
+        url: 'https://cdn.discordapp.com/attachments/1/2/notes.txt?ex=abc',
+      } as never],
+    })
+    await vi.waitFor(() => { expect(promptCalls).toHaveLength(4) })
+    expect(promptCalls[3]).toMatchObject({
+      sessionId: 'sess-twin-1',
+      prompt: 'read the attached notes',
+      mode: 'queue',
+      textParts: ['file-text-0'],
+    })
+  }, 20_000)
+
+  it('admits a file-only thread message instead of dropping it silently (16.114)', async () => {
+    const scope = discord.channel(CHANNEL)
+    const thread = await scope.waitForThread({ timeout: 10_000, predicate: t => t.name === 'hello world' })
+
+    // The real-machine repro shape: type 0, empty content, one text/plain
+    // attachment. Before 16.114 this produced zero DSH calls.
+    await discord.thread(thread.id).user(USER).sendMessage({
+      content: '',
+      attachments: [{
+        id: '999999999999999997',
+        filename: 'notes-only.txt',
+        content_type: 'text/plain; charset=utf-8',
+        size: 249,
+        url: 'https://cdn.discordapp.com/attachments/1/2/notes-only.txt?ex=abc',
+      } as never],
+    })
+    await vi.waitFor(() => { expect(promptCalls).toHaveLength(5) })
+    expect(promptCalls[4]).toMatchObject({
+      sessionId: 'sess-twin-1',
+      prompt: '',
+      mode: 'queue',
+      textParts: ['file-text-0'],
+    })
+  }, 20_000)
+})
+
+describe('twin smoke: interaction surface (bind / stop / steer)', () => {
+  let discord: DigitalDiscord
+  let rest: SharedRestClient
+  let channelId: string
+  let threadId: string
+  const runtimeRef: { current: DiscordAdapterRuntime | undefined } = { current: undefined }
+  const cancelCalls: string[] = []
+  const steerCalls: Array<{ sessionId: string; prompt: string }> = []
+  const queueSnapshotsHandle = new Map<string, Array<{ id: string; summary: string }>>()
+  const threadRows = new Map<string, ThreadBinding>()
+  const resumeSeed: Array<{ label: string; value: string; description?: string }> = []
+  const resumeBindings = new Map<string, string>()
+  const rowMap = new Map<string, ChannelBinding>()
+  /** Mutated by the D2 test: the forget-flow policy reads this live. */
+  const hostOperators: string[] = [USER]
+  let turnTracker: ReturnType<typeof createTurnTracker>
+
+  beforeAll(async () => {
+    discord = new DigitalDiscord({
+      botToken: 'twin-test-token',
+      botUser: { id: BOT, username: 'dsh' },
+      dbUrl: ':memory:',
+      guild: { id: GUILD, name: 'Twin Guild' },
+      channels: [
+        { id: CHANNEL, name: 'tmp', type: 0 },
+        { id: '444444444444444445', name: 'free', type: 0 },
+      ],
+      users: [
+        { id: USER, username: 'Addo' },
+        { id: '222222222222222223', username: 'Guest' },
+      ],
+    })
+    await discord.start()
+    rest = createSharedRestClient({ token: discord.botToken, apiBase: `${discord.restUrl}/v10` })
+
+    turnTracker = createTurnTracker()
+    const sharedRegistry = createComponentRegistry()
+    const questionsStore = createQuestionStore()
+    const questionRoutingDeps = {
+      registry: sharedRegistry,
+      store: questionsStore,
+      port: {
+        respond: () => Promise.resolve({ outcome: 'confirmed' as const }),
+      },
+      nowMs: () => Date.now(),
+      controls: { disable: () => Promise.resolve() },
+    } as unknown as Parameters<typeof handleSelectInput>[0]
+    const interactionRouter = createInteractionRouter({
+      copy: createCopy(),
+      policy: () => ({
+        allowedGuildIds: [GUILD],
+        memberUserIds: [USER, '222222222222222223'],
+        memberRoleIds: [],
+        administratorUserIds: [USER],
+        administratorRoleIds: [],
+        deniedUserIds: [],
+        deniedRoleIds: [],
+        hostOperatorUserIds: [...hostOperators],
+      }),
+      applicationId: () => BOT,
+      registry: sharedRegistry,
+      approvals: createApprovalStore({ get: () => undefined, put: async () => {} }),
+      approvalRespondPort: { respond: () => Promise.resolve({ outcome: 'confirmed' as const }) },
+      turnTracker,
+      queueSnapshots: queueSnapshotsHandle,
+      adapterVersion: () => 'test',
+      adapterStatus: () => 'connected',
+      forgetGuild: (guildId: string) => {
+        for (const [key] of [...rowMap.entries()]) {
+          const scope = parseChannelBindingKey(key)
+          if (scope?.guildId === guildId) rowMap.delete(key)
+        }
+        return Promise.resolve()
+      },
+      componentFollowUp: async (_interactionId: string, interactionToken: string, content: string) => {
+        await rest.request('POST', `/webhooks/${BOT}/${interactionToken}`, { content, flags: 64 })
+      },
+      disableControl: (key: string) => {
+        void key
+        return Promise.resolve()
+      },
+      handleQuestionComponent: input => handleSelectInput(questionRoutingDeps, input),
+      handleQuestionModal: input => handleModalSubmit(questionRoutingDeps, input),
+      dsh: {
+        cancel: (sessionId: string) => {
+          cancelCalls.push(sessionId)
+          return Promise.resolve({ outcome: 'accepted' as const })
+        },
+        steer: (sessionId: string, prompt: string) => {
+          steerCalls.push({ sessionId, prompt })
+          return Promise.resolve({ outcome: 'accepted' as const })
+        },
+        removeQueueItem: () => Promise.resolve({ outcome: 'accepted' as const }),
+        readWorkspaceDetail: () => Promise.resolve({
+          outcome: 'found' as const,
+          workspace: { id: 'ws-1', title: 'tmp', path: '/tmp' },
+        }),
+      },
+      catalogPort: {
+        listWorkspaces: () => Promise.resolve({ outcome: 'completed' as const, workspaces: [{ id: 'ws-1', title: 'tmp' }], archivedSessionIds: [] }),
+      },
+      resumeCandidates: (query: string) => Promise.resolve({
+        outcome: 'ok' as const,
+        options: resumeSeed.filter(option => option.label.toLowerCase().includes(query.trim().toLowerCase())),
+      }),
+      resumeSession: async (input: { sessionId: string; guildId: string; parentChannelId: string; actorId: string }) => {
+        for (const [threadId, owned] of resumeBindings.entries()) {
+          if (owned === input.sessionId) return { outcome: 'already-bound' as const, threadId }
+        }
+        const anchor = await rest.request('POST', `/channels/${input.parentChannelId}/messages`, { content: `📌 恢复会话：${input.sessionId}` })
+        const anchorId = anchor.outcome === 'completed' ? (anchor.body as { id?: string }).id : undefined
+        if (anchorId === undefined) return { outcome: 'failed' as const }
+        const thread = await rest.request('POST', `/channels/${input.parentChannelId}/messages/${anchorId}/threads`, { name: `Resume ${input.sessionId.slice(0, 8)}` })
+        const threadId = thread.outcome === 'completed' ? (thread.body as { id?: string }).id : undefined
+        if (threadId === undefined) return { outcome: 'failed' as const }
+        resumeBindings.set(threadId, input.sessionId)
+        return { outcome: 'started' as const, threadId }
+      },
+      modelSelectOperatorOnly: () => false,
+      permissionSelectOperatorOnly: () => true,
+      permission: {
+        catalog: () => Promise.resolve({ outcome: 'completed' as const, entries: [
+          { value: 'read-only', name: 'read-only' },
+          { value: 'workspace-write', name: 'workspace-write' },
+          { value: 'danger-full-access', name: 'danger-full-access' },
+        ] }),
+        current: () => Promise.resolve({ outcome: 'completed' as const, preset: 'workspace-write' }),
+        set: (_sessionId: string, preset: string) => Promise.resolve({ outcome: 'completed' as const, preset }),
+      },
+      model: {
+        models: () => Promise.resolve({
+          outcome: 'completed' as const,
+          models: {
+            current: { provider: 'deepseek', model: 'ds-v3' },
+            routable: true,
+            groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'ds-v3', name: 'V3' }] }],
+            failures: [],
+          },
+        }),
+        selectModel: () => Promise.resolve({ outcome: 'completed' as const, selected: { provider: 'deepseek', model: 'ds-v3' } }),
+      },
+      resolver: {
+        resolve: (reference) => reference === 'ws-1'
+          ? Promise.resolve({ outcome: 'found' as const, workspace: { id: 'ws-1', title: 'tmp' } })
+          : Promise.resolve({ outcome: 'stale' as const }),
+      },
+      channelBinding: (guildId, cid) => rowMap.get(channelBindingKey({ applicationId: BOT, guildId, channelId: cid })),
+      findBoundChannelFor: (guildId, workspaceId) => {
+        for (const [key, binding] of rowMap) {
+          if (binding.workspaceId !== workspaceId) continue
+          const parsed = parseChannelBindingKey(key)
+          if (parsed?.guildId === guildId) return parsed.channelId
+        }
+        return undefined
+      },
+      sessionForThread: (guildId, tid) =>
+        threadRows.get(threadBindingKey({ applicationId: BOT, guildId, threadId: tid }))?.sessionId,
+      ensureWorkspaceChannel: async (options) => {
+        // Minimal provisioning over the twin: reuse the same-named channel,
+        // else create a -2 sibling — mirroring the index placement.
+        const listed = await rest.request<Array<{ id: string; name: string; type: number }>>('GET', `/guilds/${options.guildId}/channels`)
+        const channels = listed.outcome === 'completed' && Array.isArray(listed.body) ? listed.body : []
+        const bind = (cid: string): void => {
+          rowMap.set(channelBindingKey({ applicationId: BOT, guildId: options.guildId, channelId: cid }), {
+            workspaceId: options.workspaceId, revision: 1, boundBy: options.actorId, boundAtMs: 1,
+          })
+        }
+        const sameName = channels.find(c => c.name === options.title && c.type === 0)
+        if (sameName !== undefined) {
+          bind(sameName.id)
+          return { channelId: sameName.id, created: false }
+        }
+        const made = await rest.request<{ id?: string } | undefined>('POST', `/guilds/${options.guildId}/channels`, {
+          name: `${options.title}-2`, type: 0,
+        })
+        if (made.outcome !== 'completed' || typeof made.body?.id !== 'string') return undefined
+        bind(made.body.id)
+        return { channelId: made.body.id, created: true }
+      },
+      rest: () => Promise.resolve(rest),
+      purgeChannelBinding: (guildId: string, channelId: string) => {
+        rowMap.delete(channelBindingKey({ applicationId: BOT, guildId, channelId }))
+        return Promise.resolve()
+      },
+      log: () => {},
+      warn: () => {},
+    })
+
+    runtimeRef.current = startDiscordAdapter({
+      tokenProvider: () => Promise.resolve(discord.botToken),
+      socketFactory: twinSocket,
+      policy: () => ({
+        allowedGuildIds: [GUILD],
+        memberUserIds: [USER, '222222222222222223'],
+        memberRoleIds: [],
+        administratorUserIds: [USER],
+        administratorRoleIds: [],
+        deniedUserIds: [],
+        deniedRoleIds: [],
+        hostOperatorUserIds: [],
+      }),
+      selfUserIdProvider: () => Promise.resolve(BOT),
+      intents: (1 << 0) | (1 << 9) | (1 << 15),
+      applicationId: () => BOT,
+      mainline: {
+        admitMention: () => Promise.resolve({ outcome: 'admitted', threadId: 't', sessionId: 's' }),
+        continueInThread: () => Promise.resolve({ outcome: 'queued' }),
+      },
+      gatewayUrl: `${discord.gatewayUrl}?v=10&encoding=json`,
+      bindings: {
+        workspaceForChannel: () => undefined,
+        sessionForThread: (guildId, tid) =>
+          threadRows.get(threadBindingKey({ applicationId: BOT, guildId, threadId: tid }))?.sessionId,
+      },
+      unboundNotice: (request) => {
+        void rest.request('POST', `/channels/${request.channelId}/messages`, {
+          content: request.audience === 'administrator'
+            ? '💡 This channel is not bound to a workspace. A workspace administrator can run `/project bind` to create and bind the project channel.'
+            : '💡 This channel is not bound to a workspace; ask a workspace administrator to run `/project bind`.',
+        })
+      },
+      approvals: createApprovalStore({ get: () => undefined, put: async () => {} }),
+      questions: createQuestionStore(),
+      status: createAdapterStatusTracker(),
+      routeInteraction: (event, token) => {
+        if (event.kind !== 'interaction') return
+        return interactionRouter.route(event, token)
+      },
+    })
+    await new Promise(resolve => { setTimeout(resolve, 500) })
+
+    // A task thread the control commands can address.
+    const source = await discord.channel(CHANNEL).user(USER).sendMessage({ content: 'task one' })
+    const made = await rest.request<{ id?: string } | undefined>(
+      'POST',
+      `/channels/${CHANNEL}/messages/${source.id}/threads`,
+      { name: 'task one', type: 11, auto_archive_duration: 1440 },
+    )
+    if (made.outcome === 'completed' && typeof made.body?.id === 'string') {
+      threadId = made.body.id
+      threadRows.set(threadBindingKey({ applicationId: BOT, guildId: GUILD, threadId }), {
+        sessionId: 'sess-1', workspaceId: 'ws-1', revision: 1, createdBy: USER, createdAtMs: 1,
+      })
+    }
+    channelId = CHANNEL
+  }, 20_000)
+
+  afterAll(async () => {
+    runtimeRef.current?.dispose()
+    await discord.stop()
+  })
+
+  it('binds a workspace through slash command and confirm button over the twin', async () => {
+    const interaction = await discord.simulateSlashCommand({
+      channelId, userId: USER, name: 'project',
+      options: [{ name: 'bind', type: 1, options: [{ name: 'workspace', type: 3, value: 'ws-1' }] }],
+    })
+    const ack = await discord.channel(channelId).waitForInteractionAck({ interactionId: interaction.id })
+    expect(ack.acknowledged).toBe(true)
+
+    // The ephemeral plan reply carries the confirm/cancel buttons.
+    const reply = await discord.channel(channelId).waitForBotReply()
+    const row = (reply.components?.[0] as { components?: Array<{ custom_id?: string; label?: string }> } | undefined)?.components ?? []
+    const confirmId = row.find(button => button.label === 'Confirm bind')?.custom_id
+    expect(confirmId).toBeDefined()
+    expect(typeof confirmId).toBe('string')
+
+    await discord.simulateButtonClick({ channelId, userId: USER, messageId: reply.id, customId: confirmId ?? '' })
+    await new Promise(resolve => { setTimeout(resolve, 400) })
+
+    // Provisioning landed: the followup reports the created (or reused)
+    // home channel, and the durable binding was written.
+    const result = await discord.channel(channelId).waitForMessage({
+      predicate: message => message.content.includes('Created a channel for workspace') || message.content.includes('already has a channel'),
+    })
+    expect(result.content).toContain('<#')
+    const keys = [...rowMap.values()]
+    expect(keys.some(binding => binding.workspaceId === 'ws-1')).toBe(true)
+  }, 20_000)
+
+  it('forgets the guild through the host-operator command and confirm button', async () => {
+    // Seed a binding that forget must remove.
+    rowMap.set(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: CHANNEL }), {
+      workspaceId: 'ws-1', revision: 1, boundBy: USER, boundAtMs: 1,
+    })
+
+    // A plain member (not a host operator) is refused.
+    await discord.prisma.guildMember.update({
+      where: { guildId_userId: { guildId: GUILD, userId: '222222222222222223' } },
+      data: { permissions: '0' },
+    })
+    const denied = await discord.simulateSlashCommand({
+      channelId, userId: '222222222222222223', name: 'guild', options: [{ name: 'forget', type: 1 }],
+    })
+    await discord.channel(channelId).waitForInteractionAck({ interactionId: denied.id })
+    await discord.channel(channelId).waitForMessage({
+      predicate: message => message.content.includes('Only Host operators can forget a Guild'),
+    })
+
+    // The operator confirms; adapter records for the guild are deleted.
+    const interaction = await discord.simulateSlashCommand({
+      channelId, userId: USER, name: 'guild', options: [{ name: 'forget', type: 1 }],
+    })
+    await discord.channel(channelId).waitForInteractionAck({ interactionId: interaction.id })
+    const plan = await discord.channel(channelId).waitForMessage({
+      predicate: message => message.content.includes('deletes every adapter-owned record for this Guild'),
+    })
+    const row = (plan.components?.[0] as { components?: Array<{ custom_id?: string }> } | undefined)?.components ?? []
+    const confirmId = row[0]?.custom_id
+    expect(typeof confirmId).toBe('string')
+
+    await discord.simulateButtonClick({ channelId, userId: USER, messageId: plan.id, customId: confirmId ?? '' })
+    const done = await discord.channel(channelId).waitForMessage({
+      predicate: message => message.content.includes('Guild forgotten'),
+    })
+    expect(done.content).toContain('DSH workspaces and sessions are untouched')
+    expect(rowMap.has(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: CHANNEL }))).toBe(false)
+  }, 20_000)
+
+  it('refuses the forget confirm click when operator status was revoked mid-flow', async () => {
+    // Review D2 (decision: re-verify at click, aligned with permission-
+    // confirm): the 15-minute control window outlives an operator
+    // revocation, and forget mutates adapter-owned state for the whole
+    // guild — the click must re-check operator authority, not just owner
+    // identity.
+    rowMap.set(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: CHANNEL }), {
+      workspaceId: 'ws-keep', revision: 1, boundBy: USER, boundAtMs: 1,
+    })
+    // Freshness filter: earlier tests already posted the same copy shapes
+    // into this channel (twin waitForMessage scans full history).
+    const seenIds = new Set((await discord.channel(channelId).getMessages()).map(message => message.id))
+
+    const interaction = await discord.simulateSlashCommand({
+      channelId, userId: USER, name: 'guild', options: [{ name: 'forget', type: 1 }],
+    })
+    await discord.channel(channelId).waitForInteractionAck({ interactionId: interaction.id })
+    const plan = await discord.channel(channelId).waitForMessage({
+      predicate: message => !seenIds.has(message.id) && message.content.includes('deletes every adapter-owned record for this Guild'),
+    })
+    const row = (plan.components?.[0] as { components?: Array<{ custom_id?: string }> } | undefined)?.components ?? []
+    const confirmId = row[0]?.custom_id
+    expect(typeof confirmId).toBe('string')
+
+    // The operator is revoked INSIDE the confirm window, then clicks.
+    hostOperators.length = 0
+    const click = await discord.simulateButtonClick({ channelId, userId: USER, messageId: plan.id, customId: confirmId ?? '' })
+    await discord.channel(channelId).waitForInteractionAck({ interactionId: click.id })
+    await new Promise(resolve => { setTimeout(resolve, 500) })
+
+    // Refused: the guild's records survive the revoked operator's click.
+    expect(rowMap.has(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: CHANNEL }))).toBe(true)
+    // Restore the operator for the tests that follow.
+    hostOperators.push(USER)
+  }, 20_000)
+
+  it('/permission show reports the current preset from the permissions projection', async () => {
+    const interaction = await discord.simulateSlashCommand({
+      channelId: threadId, userId: USER, name: 'permission', options: [{ name: 'show', type: 1 }],
+    })
+    await discord.channel(threadId).waitForInteractionAck({ interactionId: interaction.id })
+    const reply = await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('Current permission mode'),
+    })
+    expect(reply.content).toContain('Workspace edit')
+    expect(reply.content).toContain('View only')
+    expect(reply.content).toContain('Full access')
+  }, 20_000)
+
+  it('/permission set refuses a non-operator and applies for the operator', async () => {
+    // A plain member (not a host operator) is refused by the default gate.
+    await discord.prisma.guildMember.update({
+      where: { guildId_userId: { guildId: GUILD, userId: '222222222222222223' } },
+      data: { permissions: '0' },
+    })
+    const denied = await discord.simulateSlashCommand({
+      channelId: threadId, userId: '222222222222222223', name: 'permission',
+      options: [{ name: 'set', type: 1, options: [{ name: 'preset', type: 3, value: 'read-only' }] }],
+    })
+    await discord.channel(threadId).waitForInteractionAck({ interactionId: denied.id })
+    await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('Only Host operators can switch the permission mode'),
+    })
+
+    // The operator switches a plain preset directly — no confirmation.
+    const interaction = await discord.simulateSlashCommand({
+      channelId: threadId, userId: USER, name: 'permission',
+      options: [{ name: 'set', type: 1, options: [{ name: 'preset', type: 3, value: 'read-only' }] }],
+    })
+    await discord.channel(threadId).waitForInteractionAck({ interactionId: interaction.id })
+    const reply = await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('Permission mode switched'),
+    })
+    expect(reply.content).toContain('View only')
+  }, 20_000)
+
+  it('/permission set danger-full-access goes through the risk confirmation', async () => {
+    const interaction = await discord.simulateSlashCommand({
+      channelId: threadId, userId: USER, name: 'permission',
+      options: [{ name: 'set', type: 1, options: [{ name: 'preset', type: 3, value: 'danger-full-access' }] }],
+    })
+    await discord.channel(threadId).waitForInteractionAck({ interactionId: interaction.id })
+    // The risk prompt carries the explicit confirm/cancel buttons.
+    const prompt = await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('Enable "Full access"?'),
+    })
+    expect(prompt.content).toContain('sensitive operations')
+    const row = (prompt.components?.[0] as { components?: Array<{ custom_id?: string; label?: string }> } | undefined)?.components ?? []
+    const confirmId = row.find(button => button.label === 'I understand the risk, enable')?.custom_id
+    expect(typeof confirmId).toBe('string')
+
+    await discord.simulateButtonClick({ channelId: threadId, userId: USER, messageId: prompt.id, customId: confirmId ?? '' })
+    const done = await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('Permission mode switched: Full access'),
+    })
+    expect(done.content).toContain('Confirmed — switching to "Full access"')
+
+    // Settling the confirmation retires the control: BOTH buttons on the
+    // prompt message gray out so a second click never looks live (16.61).
+    await new Promise(resolve => { setTimeout(resolve, 400) })
+    const settled = (await discord.channel(threadId).getMessages()).find(message => message.id === prompt.id)
+    const settledRow = (settled?.components?.[0] as { components?: Array<{ label?: string; disabled?: boolean }> } | undefined)?.components ?? []
+    expect(settledRow.map(button => button.disabled)).toEqual([true, true])
+  }, 20_000)
+
+  it('/permission set danger-full-access cancel keeps the mode and disables the prompt', async () => {
+    const interaction = await discord.simulateSlashCommand({
+      channelId: threadId, userId: USER, name: 'permission',
+      options: [{ name: 'set', type: 1, options: [{ name: 'preset', type: 3, value: 'danger-full-access' }] }],
+    })
+    await discord.channel(threadId).waitForInteractionAck({ interactionId: interaction.id })
+    const prompt = await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('Enable "Full access"?'),
+    })
+    const row = (prompt.components?.[0] as { components?: Array<{ custom_id?: string; label?: string }> } | undefined)?.components ?? []
+    const cancelId = row.find(button => button.label === 'Cancel')?.custom_id
+    expect(typeof cancelId).toBe('string')
+    const switchesBefore = (await discord.channel(threadId).getMessages())
+      .filter(message => message.content.includes('Permission mode → ')).length
+
+    await discord.simulateButtonClick({ channelId: threadId, userId: USER, messageId: prompt.id, customId: cancelId ?? '' })
+    await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('Cancelled; the permission mode is unchanged'),
+    })
+    await new Promise(resolve => { setTimeout(resolve, 400) })
+    const settled = (await discord.channel(threadId).getMessages()).find(message => message.id === prompt.id)
+    const settledRow = (settled?.components?.[0] as { components?: Array<{ disabled?: boolean }> } | undefined)?.components ?? []
+    expect(settledRow.map(button => button.disabled)).toEqual([true, true])
+    const switchesAfter = (await discord.channel(threadId).getMessages())
+      .filter(message => message.content.includes('Permission mode → ')).length
+    expect(switchesAfter).toBe(switchesBefore)
+  }, 20_000)
+
+  it('answers a click on an unknown control with the ack plus an ephemeral rerun hint', async () => {
+    // A custom_id that was never registered (or whose TTL has passed) must
+    // not die in silence: Kimaki discipline answers it explicitly.
+    const host = await discord.channel(channelId).user(USER).sendMessage({ content: 'host message for the stale control' })
+    const interaction = await discord.simulateButtonClick({
+      channelId, userId: USER, messageId: host.id, customId: 'never-registered-id',
+    })
+    await discord.channel(channelId).waitForInteractionAck({ interactionId: interaction.id })
+    const reply = await discord.channel(channelId).waitForMessage({
+      predicate: message => message.content.includes('This control has expired'),
+    })
+    expect((reply.flags ?? 0) & 64).toBe(64)
+  }, 20_000)
+
+  it('stops the thread-owned active turn', async () => {
+    expect(typeof threadId).toBe('string')
+    const registered = turnTracker.register({ sessionId: 'sess-1', requestId: 'discord:m-1', threadId })
+    expect(registered.ok).toBe(true)
+
+    const interaction = await discord.simulateSlashCommand({ channelId: threadId, userId: USER, name: 'stop' })
+    await discord.channel(threadId).waitForInteractionAck({ interactionId: interaction.id })
+    // One queue item survives the earlier queue test, so the stop answers
+    // with the queue-preserved variant; both variants start with 🛑 Stopped.
+    const reply = await discord.channel(threadId).waitForMessage({ predicate: message => message.content.includes('🛑 Stopped') })
+    expect(reply.content).toContain('🛑 Stopped')
+    expect(((reply.flags ?? 0) & 64) !== 0).toBe(true)
+    expect(cancelCalls).toEqual(['sess-1'])
+  }, 20_000)
+
+  it('denies bind to a plain member with an ephemeral failure copy', async () => {
+    // The twin seeds every member with all permissions; demote Guest to a
+    // plain member so the administrator gate is actually exercised.
+    await discord.prisma.guildMember.update({
+      where: { guildId_userId: { guildId: GUILD, userId: '222222222222222223' } },
+      data: { permissions: '0' },
+    })
+    const interaction = await discord.simulateSlashCommand({
+      channelId, userId: '222222222222222223', name: 'project',
+      options: [{ name: 'bind', type: 1, options: [{ name: 'workspace', type: 3, value: 'ws-1' }] }],
+    })
+    await discord.channel(channelId).waitForInteractionAck({ interactionId: interaction.id })
+    const reply = await discord.channel(channelId).waitForMessage({
+      predicate: message => message.content.includes('Only workspace administrators can bind channels'),
+    })
+    expect((reply.flags ?? 0) & 64).toBe(64)
+  }, 20_000)
+
+  it('lists workspaces with names only, ephemerally', async () => {
+    const interaction = await discord.simulateSlashCommand({
+      channelId, userId: USER, name: 'project',
+      options: [{ name: 'list', type: 1 }],
+    })
+    await discord.channel(channelId).waitForInteractionAck({ interactionId: interaction.id })
+    const reply = await discord.channel(channelId).waitForMessage({
+      predicate: message => message.content.includes('Available workspaces'),
+    })
+    expect(reply.content).toContain('• tmp')
+    // Names only: opaque ids never render in the list.
+    expect(reply.content).not.toContain('ws-1')
+    expect((reply.flags ?? 0) & 64).toBe(64)
+  }, 20_000)
+
+  it('answers autocomplete with live workspace choices', async () => {
+    const interaction = await discord.simulateInteraction({
+      type: 4,
+      channelId, userId: USER,
+      data: { id: '1', name: 'project', options: [{ name: 'bind', type: 1, options: [{ name: 'workspace', type: 3, value: '', focused: true }] }] },
+    })
+    const ack = await discord.channel(channelId).waitForInteractionAck({ interactionId: interaction.id })
+    expect(ack.acknowledged).toBe(true)
+    // The type-8 choices callback carries the catalog titles.
+    const response = await discord.channel(channelId).getInteractionResponse(interaction.id)
+    expect(response?.data ?? '').toContain('tmp')
+  }, 20_000)
+
+  it('shows the bound workspace detail for an administrator, path included', async () => {
+    // Seed a binding for the command channel.
+    rowMap.set(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: CHANNEL }), {
+      workspaceId: 'ws-1', revision: 2, boundBy: USER, boundAtMs: 1,
+    })
+    const interaction = await discord.simulateSlashCommand({
+      channelId, userId: USER, name: 'project', options: [{ name: 'info', type: 1 }],
+    })
+    await discord.channel(channelId).waitForInteractionAck({ interactionId: interaction.id })
+    const reply = await discord.channel(channelId).waitForMessage({
+      predicate: message => message.content.includes('tmp'),
+    })
+    expect(reply.content).toContain('Revision 2')
+    expect(reply.content).toContain('Path:')
+    // Restore: other tests rely on the unbound state of the command channel.
+    rowMap.delete(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: CHANNEL }))
+  }, 20_000)
+
+  it('renders the mux queue snapshot and removes by position', async () => {
+    queueSnapshotsHandle.set('sess-1', [
+      { id: 'm-10', summary: 'first queued task' },
+      { id: 'm-11', summary: 'second queued task' },
+    ])
+    const list = await discord.simulateSlashCommand({
+      channelId: threadId, userId: USER, name: 'queue', options: [{ name: 'list', type: 1 }],
+    })
+    await discord.channel(threadId).waitForInteractionAck({ interactionId: list.id })
+    const view = await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('**Queue**'),
+    })
+    expect(view.content).toContain('1. first queued task')
+    expect(view.content).toContain('2. second queued task')
+
+    const remove = await discord.simulateSlashCommand({
+      channelId: threadId, userId: USER, name: 'queue',
+      options: [{ name: 'remove', type: 1, options: [{ name: 'item', type: 3, value: '1' }] }],
+    })
+    await discord.channel(threadId).waitForInteractionAck({ interactionId: remove.id })
+    const removed = await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('Removed:'),
+    })
+    expect(removed.content).toContain('first queued task')
+  }, 20_000)
+
+  it('answers an unbound-channel mention with the public bind affordance', async () => {
+    await discord.channel('444444444444444445').user(USER).sendMessage({ content: `<@${BOT}> hello there` })
+    const notice = await discord.channel('444444444444444445').waitForMessage({
+      predicate: message => message.content.includes('not bound to a workspace'),
+    })
+    expect(notice.content).toContain('/project bind')
+    // Not ephemeral: ordinary channel messages have no ephemeral channel.
+    expect((notice.flags ?? 0) & 64).toBe(0)
+  }, 20_000)
+
+  it('steers the thread-owned active turn', async () => {
+    const registered = turnTracker.register({ sessionId: 'sess-1', requestId: 'discord:m-2', threadId })
+    expect(registered.ok).toBe(true)
+
+    const interaction = await discord.simulateSlashCommand({
+      channelId: threadId, userId: USER, name: 'steer',
+      options: [{ name: 'prompt', type: 3, value: 'focus on auth' }],
+    })
+    await discord.channel(threadId).waitForInteractionAck({ interactionId: interaction.id })
+    const reply = await discord.channel(threadId).waitForMessage({ predicate: message => message.content.includes('Steering delivered') })
+    expect(reply.content).toBe('↪️ Steering delivered.')
+    expect(steerCalls).toEqual([{ sessionId: 'sess-1', prompt: 'focus on auth' }])
+  }, 20_000)
+
+  it('keeps the idempotent bind reply while the bound channel still exists', async () => {
+    // Deterministic seed: ws-1 maps to the live command channel only.
+    for (const [key, binding] of [...rowMap.entries()]) {
+      if (binding.workspaceId === 'ws-1') rowMap.delete(key)
+    }
+    rowMap.set(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: CHANNEL }), {
+      workspaceId: 'ws-1', revision: 1, boundBy: USER, boundAtMs: 1,
+    })
+    const interaction = await discord.simulateSlashCommand({
+      channelId: FREE_CHANNEL, userId: USER, name: 'project',
+      options: [{ name: 'bind', type: 1, options: [{ name: 'workspace', type: 3, value: 'ws-1' }] }],
+    })
+    await discord.channel(FREE_CHANNEL).waitForInteractionAck({ interactionId: interaction.id })
+    const reply = await discord.channel(FREE_CHANNEL).waitForMessage({
+      // The precheck reply carries no 💡 prefix — distinct from every
+      // post-ensure copy, so this wait can only match THIS flow's answer.
+      predicate: message => message.content.includes('already exists at') && !message.content.includes('💡'),
+    })
+    expect(reply.content).toContain(`<#${CHANNEL}>`)
+    expect(rowMap.has(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: CHANNEL }))).toBe(true)
+    rowMap.delete(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: CHANNEL }))
+  }, 20_000)
+
+  it('purges a stale channel mapping and binds fresh when the bound channel was deleted', async () => {
+    // The workspace maps to a channel Discord no longer has: a manual
+    // deletion is user intent — the precheck purges and proceeds, never
+    // answering the precheck copy with a <#deleted> mention (unknown).
+    const staleChannel = '999999999999999999'
+    rowMap.set(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: staleChannel }), {
+      workspaceId: 'ws-1', revision: 1, boundBy: USER, boundAtMs: 1,
+    })
+    const interaction = await discord.simulateSlashCommand({
+      channelId: FREE_CHANNEL, userId: USER, name: 'project',
+      options: [{ name: 'bind', type: 1, options: [{ name: 'workspace', type: 3, value: 'ws-1' }] }],
+    })
+    await discord.channel(FREE_CHANNEL).waitForInteractionAck({ interactionId: interaction.id })
+    const plan = await discord.channel(FREE_CHANNEL).waitForMessage({
+      predicate: message => message.content.includes('Create a dedicated channel for workspace'),
+    })
+    // The stale row was purged at the precheck, before any confirm.
+    expect(rowMap.has(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: staleChannel }))).toBe(false)
+
+    const row = (plan.components?.[0] as { components?: Array<{ custom_id?: string; label?: string }> } | undefined)?.components ?? []
+    const confirmId = row.find(button => button.label === 'Confirm bind')?.custom_id
+    expect(typeof confirmId).toBe('string')
+    await discord.simulateButtonClick({ channelId: FREE_CHANNEL, userId: USER, messageId: plan.id, customId: confirmId ?? '' })
+    const done = await discord.channel(FREE_CHANNEL).waitForMessage({
+      // Post-ensure copies carry the 💡 prefix; the idempotent precheck
+      // reply (and the unbound notice's text) never match this wait.
+      predicate: message => message.content.includes('💡') && (message.content.includes('Created a channel for workspace') || message.content.includes('already has a channel')),
+    })
+    // The landing channel is a live one, never the deleted id.
+    expect(done.content).not.toContain(`<#${staleChannel}>`)
+    const bound = [...rowMap.entries()].find(([, binding]) => binding.workspaceId === 'ws-1')
+    expect(bound).toBeDefined()
+    expect(bound?.[0]).not.toContain(staleChannel)
+  }, 20_000)
+
+  it('shows the live model directory ephemerally (/model show, 16.35)', async () => {
+    const interaction = await discord.simulateSlashCommand({
+      channelId: threadId, userId: USER, name: 'model', options: [{ name: 'show', type: 1 }],
+    })
+    await discord.channel(threadId).waitForInteractionAck({ interactionId: interaction.id })
+    const reply = await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('Current model:'),
+    })
+    expect(reply.content).toContain('`deepseek/ds-v3`')
+    expect((reply.flags ?? 0) & 64).toBe(64)
+  }, 20_000)
+
+  it('walks the provider → model cascade to apply a selection (/model select, 16.35)', async () => {
+    const interaction = await discord.simulateSlashCommand({
+      channelId: threadId, userId: USER, name: 'model', options: [{ name: 'select', type: 1 }],
+    })
+    await discord.channel(threadId).waitForInteractionAck({ interactionId: interaction.id })
+    const providerMenu = await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('Select a provider'),
+    })
+    const row = (providerMenu.components?.[0] as { components?: Array<{ custom_id?: string }> } | undefined)?.components ?? []
+    const menuId = row[0]?.custom_id
+    expect(typeof menuId).toBe('string')
+
+    await discord.simulateSelectMenu({ channelId: threadId, userId: USER, messageId: providerMenu.id, customId: menuId ?? '', values: ['deepseek'] })
+    const modelMenu = await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('Select a model'),
+    })
+    const modelRow = (modelMenu.components?.[0] as { components?: Array<{ custom_id?: string }> } | undefined)?.components ?? []
+    const modelMenuId = modelRow[0]?.custom_id
+    expect(typeof modelMenuId).toBe('string')
+
+    // ds-v3 advertises no reasoning efforts: the model pick applies directly.
+    await discord.simulateSelectMenu({ channelId: threadId, userId: USER, messageId: modelMenu.id, customId: modelMenuId ?? '', values: ['ds-v3'] })
+    const applied = await discord.channel(threadId).waitForMessage({
+      predicate: message => message.content.includes('Applied to this session'),
+    })
+    expect(applied.content).toContain('`deepseek/ds-v3`')
+  }, 20_000)
+
+  it('answers /session resume autocomplete with live title candidates (16.44)', async () => {
+    resumeSeed.length = 0
+    resumeSeed.push({ label: 'Fix auth flow', value: 'sess-9', description: '5 分钟前' })
+    const ack = await discord.simulateInteraction({
+      type: 4, channelId, userId: USER, guildId: GUILD,
+      data: { id: 'cmd-ac', name: 'session', options: [{ name: 'resume', type: 1, options: [{ name: 'session', type: 3, value: 'auth', focused: true }] }] },
+    })
+    await discord.channel(channelId).waitForInteractionAck({ interactionId: ack.id })
+    const response = await discord.channel(channelId).getInteractionResponse(ack.id)
+    const data = JSON.parse((response?.data as string | undefined) ?? '{}') as { choices?: Array<{ name: string }> }
+    expect(data.choices?.map(choice => choice.name)).toContain('Fix auth flow')
+  }, 20_000)
+
+  it('resumes a picked session into a new bound thread (16.44)', async () => {
+    resumeSeed.length = 0
+    resumeSeed.push({ label: 'Fix auth flow', value: 'sess-9', description: '5 分钟前' })
+    // Resume runs in a bound project channel: seed the channel binding.
+    rowMap.set(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId }), {
+      workspaceId: 'ws-1', revision: 1, boundBy: USER, boundAtMs: 1,
+    })
+    const interaction = await discord.simulateSlashCommand({
+      channelId, userId: USER, name: 'session',
+      options: [{ name: 'resume', type: 1, options: [{ name: 'session', type: 3, value: 'sess-9' }] }],
+    })
+    await discord.channel(channelId).waitForInteractionAck({ interactionId: interaction.id })
+    const done = await discord.channel(channelId).waitForMessage({
+      predicate: message => message.content.includes('Session resumed into'),
+    })
+    expect(done.content).toContain('<#')
+    expect([...resumeBindings.values()]).toContain('sess-9')
+  }, 20_000)
+
+  it('answers already-bound sessions with their existing thread (16.44)', async () => {
+    // Seed: sess-9 owns a thread (from the previous test) and the command
+    // channel is bound.
+    resumeBindings.set('9999999999999999', 'sess-9')
+    rowMap.set(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId }), {
+      workspaceId: 'ws-1', revision: 1, boundBy: USER, boundAtMs: 1,
+    })
+    const interaction = await discord.simulateSlashCommand({
+      channelId, userId: USER, name: 'session',
+      options: [{ name: 'resume', type: 1, options: [{ name: 'session', type: 3, value: 'sess-9' }] }],
+    })
+    await discord.channel(channelId).waitForInteractionAck({ interactionId: interaction.id })
+    await new Promise(r => { setTimeout(r, 1500) })
+    const reply = await discord.channel(channelId).waitForMessage({
+      predicate: message => message.content.includes('This session already lives in'),
+    })
+    // Whichever existing thread the mapping names, the reply must not offer
+    // a fresh adoption for an already-owned session.
+    expect(reply.content).toContain('<#')
+  }, 20_000)
+})
+
+describe('twin smoke: stream rendering over the real wire (fake DSH mux)', () => {
+  let discord: DigitalDiscord
+  let rest: SharedRestClient
+  const threadRows = new Map<string, ThreadBinding>()
+  const promptCalls: Array<{ requestId: string; sessionId: string; prompt: string; mode: string }> = []
+  const pushed: unknown[] = []
+  let runtime: DiscordAdapterRuntime
+
+  beforeAll(async () => {
+    discord = new DigitalDiscord({
+      botToken: 'twin-test-token',
+      botUser: { id: BOT, username: 'dsh' },
+      dbUrl: ':memory:',
+      guild: { id: GUILD, name: 'Twin Guild' },
+      channels: [{ id: CHANNEL, name: 'tmp', type: 0 }],
+      users: [{ id: USER, username: 'Addo' }],
+    })
+    await discord.start()
+    rest = createSharedRestClient({ token: discord.botToken, apiBase: `${discord.restUrl}/v10` })
+
+    const intents = createIntentStore(createKvTableStub())
+    const threadBindings = createBindingStore<ThreadBinding>({
+      get: key => threadRows.get(key),
+      put: (key, record) => { threadRows.set(key, record); return Promise.resolve() },
+      delete: key => Promise.resolve(threadRows.delete(key)),
+    })
+    const rowMap = new Map<string, ChannelBinding>()
+    rowMap.set(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: CHANNEL }), {
+      workspaceId: 'ws-1', revision: 1, boundBy: USER, boundAtMs: 1,
+    })
+    const threadPort: DiscordThreadPort = createRestThreadPort({
+      request: async (method, path, body) => rest.request(method, path, body),
+    })
+    const prompts: DshPromptPort = {
+      submit: (request: { requestId: string; sessionId: string; prompt: string; mode: 'queue' }) => {
+        promptCalls.push(request)
+        return Promise.resolve({ outcome: 'accepted' as const })
+      },
+    }
+    const mainline = createSessionMainline({
+      threads: createThreadCreationFlow({ intents, discord: threadPort, nowMs: () => Date.now() }),
+      sessions: createSessionCreationFlow({
+        sessions: {
+          createSession: (request: { sessionId: string }) =>
+            Promise.resolve({ outcome: 'completed' as const, sessionId: request.sessionId }),
+        },
+        threadBindings,
+        newSessionId: () => 'sess-stream',
+      }),
+      prompts: createPromptSubmissionFlow({ prompts, intents, nowMs: () => Date.now() }),
+      turns: createTurnTracker(),
+      images: {
+        collect: () => Promise.resolve({ outcome: 'collected' as const, images: [] }),
+      },
+      files: {
+        collect: () => Promise.resolve({ outcome: 'collected' as const, texts: [] }),
+      },
+    })
+
+    // The fake DSH mux: a pushable frame source the test drives after admission.
+    async function* pushableFrames(signal: AbortSignal): AsyncIterable<unknown> {
+      let index = 0
+      while (!signal.aborted) {
+        while (index < pushed.length) {
+          yield pushed[index]
+          index += 1
+        }
+        await new Promise(resolve => { setTimeout(resolve, 5) })
+      }
+    }
+
+    const live = startLiveRender({
+      frames: pushableFrames,
+      threadForSession: (sessionId: string) => {
+        for (const [key, record] of threadRows) {
+          if (record.sessionId !== sessionId) continue
+          const scope = parseThreadBindingKey(key)
+          if (scope !== undefined) return scope.threadId
+        }
+        return undefined
+      },
+      delivery: {
+        send: async (request: { channelId: string; content: string }) => {
+          const sent = await rest.request<{ id?: string } | undefined>('POST', `/channels/${request.channelId}/messages`, { content: request.content })
+          if (sent.outcome === 'completed' && typeof sent.body?.id === 'string') {
+            return { outcome: 'completed', messageId: sent.body.id }
+          }
+          return { outcome: 'failed' }
+        },
+        edit: async (request: { channelId: string; messageId: string; content: string }) => {
+          const edited = await rest.request('PATCH', `/channels/${request.channelId}/messages/${request.messageId}`, { content: request.content })
+          return edited.outcome === 'completed' ? { outcome: 'completed' } : { outcome: 'failed' }
+        },
+        delete: async (request: { channelId: string; messageId: string }) => {
+          const deleted = await rest.request('DELETE', `/channels/${request.channelId}/messages/${request.messageId}`)
+          return deleted.outcome === 'completed' ? { outcome: 'completed' } : { outcome: 'failed' }
+        },
+        typing: async (channelId: string) => {
+          await rest.request('POST', `/channels/${channelId}/typing`)
+        },
+        renameThread: async (request: { channelId: string; name: string }) => {
+          const renamed = await rest.request('PATCH', `/channels/${request.channelId}`, { name: request.name })
+          return renamed.outcome === 'completed' ? { outcome: 'completed' } : { outcome: 'failed' }
+        },
+      },
+      updateIntervalMs: 0,
+      activityCoalesceMs: 0,
+      typingIntervalMs: 60_000,
+      progressCopy: () => {
+        const copy = createCopy()
+        return {
+          thinking: copy.progressThinking,
+          thinkingStep: copy.progressThinkingStep,
+          writing: copy.progressWriting,
+          approvalWait: copy.progressApprovalWait,
+          turnSummary: copy.progressTurnSummary,
+        }
+      },
+      onTurnEnded: () => {},
+    })
+
+    runtime = startDiscordAdapter({
+      tokenProvider: () => Promise.resolve(discord.botToken),
+      socketFactory: twinSocket,
+      policy: () => ({
+        allowedGuildIds: [GUILD],
+        memberUserIds: [USER],
+        memberRoleIds: [],
+        administratorUserIds: [],
+        administratorRoleIds: [],
+        deniedUserIds: [],
+        deniedRoleIds: [],
+        hostOperatorUserIds: [],
+      }),
+      selfUserIdProvider: () => Promise.resolve(BOT),
+      intents: (1 << 0) | (1 << 9) | (1 << 15),
+      applicationId: () => BOT,
+      mainline,
+      gatewayUrl: `${discord.gatewayUrl}?v=10&encoding=json`,
+      bindings: {
+        workspaceForChannel: () => 'ws-1',
+        sessionForThread: () => undefined,
+      },
+      approvals: createApprovalStore({ get: () => undefined, put: async () => {} }),
+      questions: createQuestionStore(),
+      status: createAdapterStatusTracker(),
+    })
+    void live
+    await new Promise(resolve => { setTimeout(resolve, 500) })
+  }, 20_000)
+
+  afterAll(async () => {
+    runtime.dispose()
+    await discord.stop()
+  })
+
+  it('renders the full turn onto the twin: typing, head edits, activity rows, delete, rename', async () => {
+    const source = await discord.channel(CHANNEL).user(USER).sendMessage({ content: `<@${BOT}> 检查磁盘状态` })
+    await vi.waitFor(() => { expect(promptCalls).toHaveLength(1) })
+    const sessionId = 'sess-stream'
+    const threadBinding = [...threadRows.entries()][0]
+    const tid = threadBinding?.[0] ? (parseThreadBindingKey(threadBinding[0])?.threadId ?? '') : ''
+    expect(typeof tid).toBe('string')
+
+    // Drive the fake DSH mux: queue → turn → tool → answer → end → title.
+    pushed.push(
+      { type: 'session/queue', sessionId, items: [{ id: source.id, summary: '检查磁盘状态' }] },
+      sessionEventFrame(sessionId, 'turn/start', { turn: 1 }),
+      {
+        type: 'session/event',
+        sessionId,
+        event: { type: 'tool/call', data: { turn: 1, step: 1, callId: 'c-1', name: 'bash', arguments: '{"command":"df -h"}' } },
+        view: { for: 'call', view: { card: 'terminal', title: 'df -h' } },
+      },
+      sessionEventFrame(sessionId, 'assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: '磁盘状态如下' } }),
+      {
+        type: 'session/event',
+        sessionId,
+        event: { type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '磁盘状态如下：主数据卷已用 96%。' }] } } },
+      },
+      sessionEventFrame(sessionId, 'turn/end', { turn: 1, reason: { kind: 'stop' } }),
+      { type: 'session/projection', sessionId, key: 'title', value: '检查磁盘状态' },
+    )
+
+    // The answer finalizes on the twin.
+    const answer = await discord.thread(tid).waitForMessage({
+      predicate: message => message.content.includes('主数据卷已用 96%'),
+    })
+    expect(answer.author.bot).toBe(true)
+
+    // Typing fired at the ENQUEUED moment (before any turn event).
+    const typing = discord.getTypingEvents({ channelId: tid })
+    expect(typing.length).toBeGreaterThanOrEqual(1)
+
+    // The session title renamed the thread (title rename).
+    const renamed = await discord.channel(CHANNEL).waitForThread({
+      timeout: 10_000,
+      predicate: t => t.name === '检查磁盘状态',
+    })
+    expect(renamed.id).toBe(tid)
+
+    // Turn end deleted the tool activity message: no activity rows remain.
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+    const leftovers = (await discord.thread(tid).getMessages()).filter(message => message.content.startsWith('> 💻'))
+    expect(leftovers).toHaveLength(0)
+  }, 30_000)
+
+  it('shows the progress status line during the turn and cleans it up on finalize (turn-progress)', async () => {
+    const sessionId = 'sess-stream'
+    const threadBinding = [...threadRows.entries()][0]
+    const tid = threadBinding?.[0] ? (parseThreadBindingKey(threadBinding[0])?.threadId ?? '') : ''
+    expect(typeof tid).toBe('string')
+
+    // A second turn on the same bound thread: thinking phase opens the
+    // status message, the running tool takes over the phase line.
+    pushed.push(
+      sessionEventFrame(sessionId, 'turn/start', { turn: 2 }),
+      sessionEventFrame(sessionId, 'step/start', { turn: 2, step: 1 }),
+      sessionEventFrame(sessionId, 'tool/call', { turn: 2, step: 1, callId: 'c-prog', name: 'bash', arguments: '{"command":"git status --short"}' }),
+    )
+    const status = await discord.thread(tid).waitForMessage({
+      predicate: message => message.content.includes('💻') && message.content.includes('git status --short'),
+    })
+    // The status message is phase-line first, rows below.
+    expect(status.content.startsWith('💻')).toBe(true)
+
+    // The result marks the row, the turn ends, and the status message is
+    // removed — only the durable answer may remain.
+    pushed.push(
+      sessionEventFrame(sessionId, 'tool/result', {
+        turn: 2,
+        step: 1,
+        message: { role: 'user', content: [{ type: 'tool-result', toolCallId: 'c-prog', isError: false }] },
+      }),
+      sessionEventFrame(sessionId, 'assistant/message', {
+        turn: 2,
+        step: 1,
+        message: { role: 'assistant', content: [{ type: 'text', text: '工作区是干净的。' }] },
+      }),
+      sessionEventFrame(sessionId, 'turn/end', { turn: 2, reason: { kind: 'completed' } }),
+    )
+    await discord.thread(tid).waitForMessage({ predicate: message => message.content.includes('工作区是干净的') })
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+    // The status message collapsed into the one-line turn summary and stays
+    // (decision 5); no live phase markers (⏳/💻/✍️) remain.
+    const messages = await discord.thread(tid).getMessages()
+    const summaries = messages.filter(message => message.content.includes('⚙️'))
+    expect(summaries.length).toBeGreaterThanOrEqual(1)
+    expect(summaries.at(-1)?.content).toContain('1 tool calls this turn')
+    expect(summaries.at(-1)?.content).toContain('Shell ×1')
+    const liveMarkers = messages.filter(message => /⏳|💻|✍️/.test(message.content))
+    expect(liveMarkers).toHaveLength(0)
+  }, 30_000)
+})
+
+/** Build one session/event frame the way the Host mux wraps it. */
+function sessionEventFrame(sessionId: string, type: string, data: Record<string, unknown>): unknown {
+  return { type: 'session/event', sessionId, event: { type, data } }
+}
+
+describe('twin smoke: approval/question round trip with a STRICT fake DSH', () => {
+  let discord: DigitalDiscord
+  let rest: SharedRestClient
+  let runtime: DiscordAdapterRuntime
+  let threadId = ''
+  const runtimeRef: { current: DiscordAdapterRuntime | undefined } = { current: undefined }
+  /** Settle-model records: one entry per answer the click pipeline settled. */
+  const settleRecords: Array<{ kind: 'approval' | 'question'; key: string; outcome?: string; answer?: unknown }> = []
+  /** The ask callbacks the composed answerer drives in production (host-asks). */
+  let askSink: {
+    onApprovalRequested(input: { sessionId: string; threadId: string; rpcId: string; approvalId: string; toolName: string; reason?: string | undefined; expiresAtMs: number }): void
+    onQuestionRequested(input: { sessionId: string; threadId: string; rpcId: string; expiresAtMs: number; questions: ReadonlyArray<Record<string, unknown>> }): void
+    onQuestionResolved(input: { sessionId: string; questionRpcId: string; outcome: 'answered' | 'cancelled' }): void
+    onApprovalResolved(input: { sessionId: string; approvalId: string; outcome?: string | undefined }): void
+  }
+  /** Type-9 (show-modal) interaction callbacks, for minted modal custom_id capture. */
+  const interactionCallbacks: Array<Record<string, unknown>> = []
+  const controlMessages = new Map<string, { channelId: string; messageId: string }>()
+  let turnTracker: ReturnType<typeof createTurnTracker>
+  let approvalsStore: ReturnType<typeof createApprovalStore>
+
+  beforeAll(async () => {
+    discord = new DigitalDiscord({
+      botToken: 'twin-test-token',
+      botUser: { id: BOT, username: 'dsh' },
+      dbUrl: ':memory:',
+      guild: { id: GUILD, name: 'Twin Guild' },
+      channels: [{ id: CHANNEL, name: 'tmp', type: 0 }],
+      users: [{ id: USER, username: 'Addo' }],
+    })
+    await discord.start()
+    rest = createSharedRestClient({ token: discord.botToken, apiBase: `${discord.restUrl}/v10` })
+
+    // A REAL twin thread channel: the controls are Discord messages in it.
+    const source = await discord.channel(CHANNEL).user(USER).sendMessage({ content: 'approval task' })
+    const made = await rest.request<{ id?: string } | undefined>(
+      'POST',
+      `/channels/${CHANNEL}/messages/${source.id}/threads`,
+      { name: 'approval task', type: 11, auto_archive_duration: 1440 },
+    )
+    if (made.outcome === 'completed' && typeof made.body?.id === 'string') {
+      threadId = made.body.id
+    }
+
+    turnTracker = createTurnTracker()
+    const sharedRegistry = createComponentRegistry()
+    approvalsStore = createApprovalStore(createKvTableStub())
+    const questionsStore = createQuestionStore()
+
+    // ── Settle-model ports: the 0.1.6 composed answerer resolves asks
+    // in-process, so the click pipeline's ports record settles (what
+    // production's host-asks settle ports do) instead of wire envelopes.
+    const settleApproval = (approvalId: string, outcome: string): void => {
+      settleRecords.push({ kind: 'approval', key: approvalId, outcome })
+    }
+    const settleQuestion = (rpcId: string, answer: unknown): void => {
+      settleRecords.push({ kind: 'question', key: rpcId, answer })
+    }
+
+
+    const disableControl = async (key: string): Promise<void> => {
+      const target = controlMessages.get(key)
+      if (target === undefined) return
+      controlMessages.delete(key)
+      await rest.request('PATCH', `/channels/${target.channelId}/messages/${target.messageId}`, { components: [] })
+    }
+    const componentFollowUp = async (interactionToken: string, content: string): Promise<void> => {
+      await rest.request('POST', `/webhooks/${BOT}/${interactionToken}`, { content, flags: 64 })
+    }
+
+    const questionRoutingDeps = {
+      registry: sharedRegistry,
+      store: questionsStore,
+      port: {
+        respond: (input: { rpcId: string; sessionId: string; answer: { answers: Array<{ id: string; selected: string[]; custom?: string }> } }) => {
+          settleQuestion(input.rpcId, input.answer)
+          return Promise.resolve({ outcome: 'confirmed' as const })
+        },
+      },
+      nowMs: () => Date.now(),
+      controls: { disable: disableControl },
+    } as unknown as Parameters<typeof handleSelectInput>[0]
+
+    const interactionRouter = createInteractionRouter({
+      copy: createCopy(),
+      policy: () => ({
+        allowedGuildIds: [GUILD],
+        memberUserIds: [USER],
+        memberRoleIds: [],
+        administratorUserIds: [],
+        administratorRoleIds: [],
+        deniedUserIds: [],
+        deniedRoleIds: [],
+        hostOperatorUserIds: [],
+      }),
+      applicationId: () => BOT,
+      registry: sharedRegistry,
+      approvals: approvalsStore,
+      approvalRespondPort: {
+        respond: ({ approvalId, outcome }) => {
+          settleApproval(approvalId, outcome)
+          return Promise.resolve({ outcome: 'confirmed' as const })
+        },
+      },
+      turnTracker,
+      queueSnapshots: new Map(),
+      forgetGuild: () => Promise.resolve(),
+      adapterVersion: () => "test",
+      adapterStatus: () => "connected",
+      componentFollowUp: async (_interactionId: string, interactionToken: string, content: string) => {
+        await componentFollowUp(interactionToken, content)
+      },
+      disableControl,
+      handleQuestionComponent: input => handleSelectInput(questionRoutingDeps, input),
+      handleQuestionModal: input => handleModalSubmit(questionRoutingDeps, input),
+      dsh: {
+        cancel: () => Promise.resolve({ outcome: 'accepted' as const }),
+        steer: () => Promise.resolve({ outcome: 'accepted' as const }),
+        removeQueueItem: () => Promise.resolve({ outcome: 'accepted' as const }),
+        readWorkspaceDetail: () => Promise.resolve({ outcome: 'stale' }),
+      },
+      catalogPort: { listWorkspaces: () => Promise.resolve({ outcome: 'completed' as const, workspaces: [], archivedSessionIds: [] }) },
+      resolver: { resolve: () => Promise.resolve({ outcome: 'stale' }) },
+      channelBinding: () => undefined,
+      findBoundChannelFor: () => undefined,
+      sessionForThread: () => undefined,
+      ensureWorkspaceChannel: () => Promise.resolve(undefined),
+      rest: () => Promise.resolve({
+        request: async (method: string, path: string, body?: unknown) => {
+          if (method === 'POST' && path.includes('/interactions/') && (body as { type?: number } | undefined)?.type === 9) {
+            interactionCallbacks.push(body as Record<string, unknown>)
+          }
+          return rest.request(method as never, path as never, body)
+        },
+      } as never),
+      resumeCandidates: () => Promise.resolve({ outcome: 'ok' as const, options: [] }),
+      resumeSession: () => Promise.resolve({ outcome: 'failed' as const }),
+      modelSelectOperatorOnly: () => false,
+      permissionSelectOperatorOnly: () => true,
+      permission: {
+        catalog: () => Promise.resolve({ outcome: 'completed' as const, entries: [
+          { value: 'read-only', name: 'read-only' },
+          { value: 'workspace-write', name: 'workspace-write' },
+          { value: 'danger-full-access', name: 'danger-full-access' },
+        ] }),
+        current: () => Promise.resolve({ outcome: 'completed' as const, preset: 'workspace-write' }),
+        set: (_sessionId: string, preset: string) => Promise.resolve({ outcome: 'completed' as const, preset }),
+      },
+      model: {
+        models: () => Promise.resolve({
+          outcome: 'completed' as const,
+          models: {
+            current: { provider: 'deepseek', model: 'ds-v3' },
+            routable: true,
+            groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'ds-v3', name: 'V3' }] }],
+            failures: [],
+          },
+        }),
+        selectModel: () => Promise.resolve({ outcome: 'completed' as const, selected: { provider: 'deepseek', model: 'ds-v3' } }),
+      },
+      purgeChannelBinding: async () => {},
+      log: () => {},
+      warn: () => {},
+    })
+
+    runtime = startDiscordAdapter({
+      registry: sharedRegistry,
+      tokenProvider: () => Promise.resolve(discord.botToken),
+      socketFactory: twinSocket,
+      policy: () => ({
+        allowedGuildIds: [GUILD],
+        memberUserIds: [USER],
+        memberRoleIds: [],
+        administratorUserIds: [],
+        administratorRoleIds: [],
+        deniedUserIds: [],
+        deniedRoleIds: [],
+        hostOperatorUserIds: [],
+      }),
+      selfUserIdProvider: () => Promise.resolve(BOT),
+      intents: (1 << 0) | (1 << 9) | (1 << 15),
+      applicationId: () => BOT,
+      mainline: {
+        admitMention: () => Promise.resolve({ outcome: 'admitted', threadId: 't', sessionId: 's' }),
+        continueInThread: () => Promise.resolve({ outcome: 'queued' }),
+      },
+      gatewayUrl: `${discord.gatewayUrl}?v=10&encoding=json`,
+      bindings: {
+        workspaceForChannel: () => undefined,
+        sessionForThread: () => undefined,
+      },
+      approvals: approvalsStore,
+      questions: questionsStore,
+      status: createAdapterStatusTracker(),
+      routeInteraction: (event, token) => {
+        if (event.kind !== 'interaction') return
+        return interactionRouter.route(event, token)
+      },
+    })
+    runtimeRef.current = runtime
+
+    // The live renderer with index-style requests wiring over the strict port.
+    const live = startLiveRender({
+      frames: () => (async function* () {})(),
+      threadForSession: (sessionId: string) => sessionId === 'sess-1' ? threadId : undefined,
+      delivery: {
+        send: async (request) => {
+          const sent = await rest.request<{ id?: string } | undefined>('POST', `/channels/${request.channelId}/messages`, { content: request.content })
+          if (sent.outcome === 'completed' && typeof sent.body?.id === 'string') {
+            return { outcome: 'completed', messageId: sent.body.id }
+          }
+          return { outcome: 'failed' }
+        },
+        edit: async (request) => {
+          const edited = await rest.request('PATCH', `/channels/${request.channelId}/messages/${request.messageId}`, { content: request.content })
+          return edited.outcome === 'completed' ? { outcome: 'completed' } : { outcome: 'failed' }
+        },
+        delete: () => Promise.resolve({ outcome: 'completed' as const }),
+        typing: async () => {},
+        renameThread: () => Promise.resolve({ outcome: 'completed' as const }),
+      },
+      updateIntervalMs: 0,
+      activityCoalesceMs: 0,
+      typingIntervalMs: 60_000,
+    })
+    // The ask callbacks the composed answerer drives (host-asks in
+    // production): assigned standalone, since asks no longer ride frames.
+    askSink = {
+        onApprovalRequested: (input) => {
+          void input.threadId
+          approvalsStore.open({
+            approvalId: input.approvalId,
+            sessionId: input.sessionId,
+            threadId: input.threadId,
+            requestId: 'discord:m-1',
+            rpcId: input.rpcId,
+            actorUserId: USER,
+            toolName: input.toolName,
+            reason: input.reason,
+            expiresAtMs: input.expiresAtMs,
+            state: 'pending',
+          })
+          turnTracker.register({ sessionId: input.sessionId, requestId: 'discord:m-1', threadId: input.threadId })
+          const payload = renderApprovalControls({
+            registry: sharedRegistry,
+            sessionId: input.sessionId,
+            rpcId: input.rpcId,
+            approvalId: input.approvalId,
+            toolName: input.toolName,
+            reason: input.reason,
+            expiresAtMs: input.expiresAtMs,
+          })
+          void (async () => {
+            const sent = await rest.request<{ id?: string } | undefined>('POST', `/channels/${input.threadId}/messages`, payload)
+            if (sent.outcome === 'completed' && typeof sent.body?.id === 'string') {
+              controlMessages.set(input.approvalId, { channelId: input.threadId, messageId: sent.body.id })
+            }
+          })().catch(() => {})
+        },
+        onApprovalResolved: () => {},
+        onQuestionRequested: (input) => {
+          const batch = {
+            questionRpcId: input.rpcId,
+            sessionId: input.sessionId,
+            threadId: input.threadId,
+            requestId: 'discord:m-1',
+            actorUserId: USER,
+            expiresAtMs: input.expiresAtMs,
+            questions: input.questions.map(question => ({
+              id: typeof question['id'] === 'string' ? question['id'] : '',
+              question: typeof question['question'] === 'string' ? question['question'] : '',
+              header: typeof question['header'] === 'string' ? question['header'] : undefined,
+              options: Array.isArray(question['options'])
+                ? question['options'].map(option => ({
+                    label: typeof (option as { label?: unknown }).label === 'string'
+                      ? (option as { label: string }).label
+                      : '',
+                  }))
+                : undefined,
+              multiSelect: question['multiSelect'] === true,
+            })),
+          }
+          const opened = questionsStore.open(batch)
+          if (!opened.ok) return
+          const payload = renderQuestionControls({ registry: sharedRegistry, batch })
+          void (async () => {
+            const sent = await rest.request<{ id?: string } | undefined>('POST', `/channels/${input.threadId}/messages`, payload)
+            if (sent.outcome === 'completed' && typeof sent.body?.id === 'string') {
+              controlMessages.set(input.rpcId, { channelId: input.threadId, messageId: sent.body.id })
+            }
+          })().catch(() => {})
+        },
+        onQuestionResolved: (input) => {
+          void handleRemoteResolution({ store: questionsStore, controls: { disable: disableControl }, nowMs: () => Date.now() }, {
+            questionRpcId: input.questionRpcId,
+            outcome: input.outcome,
+          }).catch(() => {})
+        },
+      }
+    void live
+    await new Promise(resolve => { setTimeout(resolve, 500) })
+  }, 20_000)
+
+  afterAll(async () => {
+    runtimeRef.current?.dispose()
+    await discord.stop()
+  })
+
+  it('carries an approval click into a settled composed-answerer outcome', async () => {
+    askSink.onApprovalRequested({
+      sessionId: 'sess-1', threadId, rpcId: 'ask-approval', approvalId: '7c4a447f',
+      toolName: 'bash', reason: 'write outside workspace', expiresAtMs: Date.now() + 600_000,
+    })
+
+    const scope = discord.channel(threadId)
+    const control = await scope.waitForMessage({
+      predicate: message => message.content.includes('Approval required'),
+    })
+    const row = (control.components?.[0] as { components?: Array<{ custom_id?: string; label?: string }> } | undefined)?.components ?? []
+    const allowId = row.find(button => button.label === 'Allow once')?.custom_id
+    if (typeof allowId !== 'string') throw new TypeError('allow control missing custom_id')
+
+    await discord.simulateButtonClick({ channelId: threadId, userId: USER, messageId: control.id, customId: allowId })
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+
+    // The settle port recorded exactly one answer for the claimed ask.
+    const settled = settleRecords.filter(record => record.key === '7c4a447f')
+    expect(settled).toEqual([{ kind: 'approval', key: '7c4a447f', outcome: 'allowed-once' }])
+    // Controls retired on the confirmed answer.
+    const edited = await discord.thread(threadId).getMessages()
+    const controlAfter = edited.find(message => message.id === control.id)
+    expect(controlAfter).toBeDefined()
+    expect(controlAfter?.components ?? []).toHaveLength(0)
+  }, 20_000)
+
+  it('carries a question select + submit into a shape-correct answer batch', async () => {
+    askSink.onQuestionRequested({
+      sessionId: 'sess-1', threadId, rpcId: 'ask-question', expiresAtMs: Date.now() + 600_000,
+      questions: [{
+        id: 'q1',
+        question: 'How to proceed',
+        options: [
+          { label: 'Retry with approval (Recommended)' },
+          { label: 'Create in /private/tmp' },
+          { label: 'Other — tell us in your own words' },
+        ],
+      }],
+    })
+
+    const scope = discord.channel(threadId)
+    const control = await scope.waitForMessage({
+      predicate: message => message.content.includes('How to proceed'),
+    })
+    const rows = control.components as Array<{ components: Array<{ custom_id?: string }> }>
+    const selectCustomId = rows[0]?.components[0]?.custom_id
+    if (typeof selectCustomId !== 'string') throw new TypeError('select control missing custom_id')
+
+    // Select the first option, then submit.
+    await discord.simulateSelectMenu({
+      channelId: threadId, userId: USER, messageId: control.id, customId: selectCustomId,
+      values: ['Retry with approval (Recommended)'],
+    })
+    await new Promise(resolve => { setTimeout(resolve, 200) })
+    const submitCustomId = rows.at(-1)?.components[0]?.custom_id
+    if (typeof submitCustomId !== 'string') throw new TypeError('submit control missing custom_id')
+    await discord.simulateButtonClick({
+      channelId: threadId, userId: USER, messageId: control.id,
+      customId: submitCustomId,
+    })
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+
+    const sent = settleRecords.filter(record => record.key === 'ask-question')
+    expect(sent).toHaveLength(1)
+    expect(sent[0]).toMatchObject({
+      kind: 'question',
+      answer: { answers: [{ id: 'q1', selected: ['Retry with approval (Recommended)'] }] },
+    })
+  }, 20_000)
+
+  it('auto-submits a five-question batch when its last answer lands', async () => {
+    // Five selects fill Discord's five-action-row cap, so the batch renders
+    // WITHOUT a Submit button: the last answer landing must submit the ask
+    // by itself, or the turn hangs until the expiry sweep cancels it.
+    askSink.onQuestionRequested({
+      sessionId: 'sess-1', threadId, rpcId: 'ask-five', expiresAtMs: Date.now() + 600_000,
+      questions: Array.from({ length: 5 }, (_, index) => ({
+        id: `f${String(index + 1)}`,
+        question: `Five-batch probe ${String(index + 1)}`,
+        options: [{ label: `Opt ${String(index + 1)}A` }, { label: `Opt ${String(index + 1)}B` }],
+      })),
+    })
+
+    const scope = discord.channel(threadId)
+    const control = await scope.waitForMessage({
+      predicate: message => message.content.includes('5 questions need answers'),
+    })
+    const rows = control.components as Array<{ components: Array<{ custom_id?: string }> }>
+    // Five select rows, no submit row to click.
+    expect(rows).toHaveLength(5)
+
+    for (let index = 0; index < 5; index += 1) {
+      const selectId = rows[index]?.components[0]?.custom_id
+      if (typeof selectId !== 'string') throw new TypeError(`select ${String(index)} missing custom_id`)
+      await discord.simulateSelectMenu({
+        channelId: threadId, userId: USER, messageId: control.id, customId: selectId,
+        values: [`Opt ${String(index + 1)}A`],
+      })
+      await new Promise(resolve => { setTimeout(resolve, 200) })
+    }
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+
+    const sent = settleRecords.filter(record => record.key === 'ask-five')
+    expect(sent).toHaveLength(1)
+    expect(sent[0]).toMatchObject({
+      kind: 'question',
+      answer: { answers: Array.from({ length: 5 }, (_, index) => ({
+        id: `f${String(index + 1)}`,
+        selected: [`Opt ${String(index + 1)}A`],
+      })) },
+    })
+  }, 20_000)
+
+  it('never settles a claimed ask twice, even from a repeated click', async () => {
+    // The Host-semantics regression: an ask answered once is no longer
+    // pending — a duplicate answer must NOT be treated as delivered.
+    askSink.onApprovalRequested({
+      sessionId: 'sess-1', threadId, rpcId: 'ask-dupe', approvalId: 'dupe-1',
+      toolName: 'dupe-op', expiresAtMs: Date.now() + 600_000,
+    })
+    const scope = discord.channel(threadId)
+    const control = await scope.waitForMessage({
+      predicate: message => message.content.includes('Approval required — Tool'),
+    })
+    const row = (control.components?.[0] as { components?: Array<{ custom_id?: string }> } | undefined)?.components ?? []
+    const allowId = row[0]?.custom_id ?? ''
+    await discord.simulateButtonClick({ channelId: threadId, userId: USER, messageId: control.id, customId: allowId })
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+    expect(settleRecords.filter(record => record.key === 'dupe-1')).toHaveLength(1)
+
+    // A second click on the retired control: the claim already resolved, so
+    // the pipeline answers already-resolved and settles nothing new.
+    await discord.simulateButtonClick({ channelId: threadId, userId: USER, messageId: control.id, customId: allowId })
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+    expect(settleRecords.filter(record => record.key === 'dupe-1')).toHaveLength(1)
+  }, 20_000)
+
+  it('carries a Reject click into outcome rejected', async () => {
+    askSink.onApprovalRequested({
+      sessionId: 'sess-1', threadId, rpcId: 'ask-reject', approvalId: 'rej-1',
+      toolName: 'edit', expiresAtMs: Date.now() + 600_000,
+    })
+    const scope = discord.channel(threadId)
+    const control = await scope.waitForMessage({
+      predicate: message => message.content.includes('Approval required — Edit'),
+    })
+    const row = (control.components?.[0] as { components?: Array<{ custom_id?: string; label?: string }> } | undefined)?.components ?? []
+    const rejectId = row.find(button => button.label === 'Reject')?.custom_id
+    if (typeof rejectId !== 'string') throw new TypeError('reject control missing custom_id')
+
+    await discord.simulateButtonClick({ channelId: threadId, userId: USER, messageId: control.id, customId: rejectId })
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+
+    const sent = settleRecords.filter(record => record.key === 'rej-1')
+    expect(sent).toEqual([{ kind: 'approval', key: 'rej-1', outcome: 'rejected' }])
+  }, 20_000)
+
+  it('carries the Other modal answer through modal submit into the batch', async () => {
+    askSink.onQuestionRequested({
+      sessionId: 'sess-1', threadId, rpcId: 'ask-modal', expiresAtMs: Date.now() + 600_000,
+      questions: [{ id: 'q1', question: '部署策略怎么选', options: [{ label: 'Option A' }] }],
+    })
+    const scope = discord.channel(threadId)
+    const control = await scope.waitForMessage({
+      predicate: message => message.content.includes('部署策略怎么选'),
+    })
+    const rows = control.components as Array<{ components: Array<{ custom_id?: string }> }>
+    const selectCustomId = rows[0]?.components[0]?.custom_id
+    if (typeof selectCustomId !== 'string') throw new TypeError('select control missing custom_id')
+
+    // The reserved Other value opens the modal instead of recording.
+    await discord.simulateSelectMenu({
+      channelId: threadId, userId: USER, messageId: control.id, customId: selectCustomId,
+      values: [CUSTOM_ANSWER_VALUE],
+    })
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+    const modal = interactionCallbacks.at(-1) as { data?: { custom_id?: string; title?: string } } | undefined
+    const modalCustomId = modal?.data?.custom_id
+    if (typeof modalCustomId !== 'string') throw new TypeError('modal callback missing custom_id')
+    // MODAL callbacks require `title` (1–45 chars). The twin accepts the body
+    // without form-validating it, so a missing title showed up only on a real
+    // Discord as a silent drop — assert the wire shape here.
+    expect(modal?.data?.title).toBe('部署策略怎么选')
+
+    await discord.simulateModalSubmit({
+      channelId: threadId, userId: USER, customId: modalCustomId,
+      fields: [{ customId: 'answer', value: '改为只读挂载' }],
+    })
+    await new Promise(resolve => { setTimeout(resolve, 200) })
+
+    const submitCustomId = rows.at(-1)?.components[0]?.custom_id
+    if (typeof submitCustomId !== 'string') throw new TypeError('submit control missing custom_id')
+    await discord.simulateButtonClick({
+      channelId: threadId, userId: USER, messageId: control.id, customId: submitCustomId,
+    })
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+
+    const sent = settleRecords.filter(record => record.key === 'ask-modal')
+    expect(sent).toHaveLength(1)
+    expect(sent[0]).toMatchObject({
+      kind: 'question',
+      answer: { answers: [{ id: 'q1', selected: [], custom: '改为只读挂载' }] },
+    })
+  }, 20_000)
+
+  it('keeps the options ticked alongside Other in a multi-select modal answer', async () => {
+    askSink.onQuestionRequested({
+      sessionId: 'sess-1', threadId, rpcId: 'ask-multi-other', expiresAtMs: Date.now() + 600_000,
+      questions: [{
+        id: 'q1',
+        question: '部署方式怎么选',
+        options: [{ label: 'Option A' }, { label: 'Option B' }],
+        multiSelect: true,
+      }],
+    })
+    const scope = discord.channel(threadId)
+    const control = await scope.waitForMessage({
+      predicate: message => message.content.includes('部署方式怎么选'),
+    })
+    const rows = control.components as Array<{ components: Array<{ custom_id?: string }> }>
+    const selectCustomId = rows[0]?.components[0]?.custom_id
+    if (typeof selectCustomId !== 'string') throw new TypeError('select control missing custom_id')
+
+    // Option A stays ticked while the custom value opens the modal.
+    await discord.simulateSelectMenu({
+      channelId: threadId, userId: USER, messageId: control.id, customId: selectCustomId,
+      values: ['Option A', CUSTOM_ANSWER_VALUE],
+    })
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+    const modal = interactionCallbacks.at(-1) as { data?: { custom_id?: string } } | undefined
+    const modalCustomId = modal?.data?.custom_id
+    if (typeof modalCustomId !== 'string') throw new TypeError('modal callback missing custom_id')
+
+    await discord.simulateModalSubmit({
+      channelId: threadId, userId: USER, customId: modalCustomId,
+      fields: [{ customId: 'answer', value: '改为只读挂载' }],
+    })
+    await new Promise(resolve => { setTimeout(resolve, 200) })
+
+    const submitCustomId = rows.at(-1)?.components[0]?.custom_id
+    if (typeof submitCustomId !== 'string') throw new TypeError('submit control missing custom_id')
+    await discord.simulateButtonClick({
+      channelId: threadId, userId: USER, messageId: control.id, customId: submitCustomId,
+    })
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+
+    const sent = settleRecords.filter(record => record.key === 'ask-multi-other')
+    expect(sent).toHaveLength(1)
+    expect(sent[0]).toMatchObject({
+      kind: 'question',
+      answer: { answers: [{ id: 'q1', selected: ['Option A'], custom: '改为只读挂载' }] },
+    })
+  }, 20_000)
+
+  it('retires question controls on a remote resolution without submitting', async () => {
+    askSink.onQuestionRequested({
+      sessionId: 'sess-1', threadId, rpcId: 'ask-remote', expiresAtMs: Date.now() + 600_000,
+      questions: [{ id: 'q1', question: 'Remote resolution target', options: [{ label: 'A' }, { label: 'B' }] }],
+    })
+    const scope = discord.channel(threadId)
+    const control = await scope.waitForMessage({
+      predicate: message => message.content.includes('Remote resolution target'),
+    })
+    const rows = control.components as Array<{ components: Array<{ custom_id?: string }> }>
+    const selectCustomId = rows[0]?.components[0]?.custom_id
+    if (typeof selectCustomId !== 'string') throw new TypeError('select control missing custom_id')
+    const submitCustomId = rows.at(-1)?.components[0]?.custom_id
+    if (typeof submitCustomId !== 'string') throw new TypeError('submit control missing custom_id')
+
+    askSink.onQuestionResolved({ sessionId: 'sess-1', questionRpcId: 'ask-remote', outcome: 'answered' })
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+
+    // Controls retired; later clicks settle as already-resolved, never a respond.
+    const edited = await discord.thread(threadId).getMessages()
+    const controlAfter = edited.find(message => message.id === control.id)
+    expect(controlAfter?.components ?? []).toHaveLength(0)
+
+    const before = settleRecords.length
+    await discord.simulateSelectMenu({
+      channelId: threadId, userId: USER, messageId: control.id, customId: selectCustomId,
+      values: ['A'],
+    })
+    await discord.simulateButtonClick({ channelId: threadId, userId: USER, messageId: control.id, customId: submitCustomId })
+    await new Promise(resolve => { setTimeout(resolve, 300) })
+    expect(settleRecords.filter(record => record.key === 'ask-remote')).toHaveLength(0)
+    expect(settleRecords.length).toBe(before)
+  }, 20_000)
+})
+
+describe('twin smoke: isolation matrix (15.11)', () => {
+  const GUILD2 = '333333333333333334'
+  const GUILD3 = '333333333333333335' // present on the wire, absent from the allowlist
+  const CHANNEL2 = '444444444444444446'
+  const CHANNEL3 = '444444444444444447'
+  const GUEST = '222222222222222223'
+  let discord: DigitalDiscord
+  let rest: SharedRestClient
+  const runtimeRef: { current: DiscordAdapterRuntime | undefined } = { current: undefined }
+  const rowMap = new Map<string, ChannelBinding>()
+  const admissions: Array<Record<string, unknown>> = []
+  const continuations: Array<Record<string, unknown>> = []
+  const notices: Array<{ channelId: string; audience: string }> = []
+  const followups: Array<{ channelId: string; content: string }> = []
+
+  beforeAll(async () => {
+    discord = new DigitalDiscord({
+      botToken: 'twin-test-token',
+      botUser: { id: BOT, username: 'dsh' },
+      dbUrl: ':memory:',
+      guilds: [
+        { id: GUILD, name: 'G1', channels: [{ id: CHANNEL, name: 'general', type: 0 }] },
+        { id: GUILD2, name: 'G2', channels: [{ id: CHANNEL2, name: 'general', type: 0 }] },
+        { id: GUILD3, name: 'G3', channels: [{ id: CHANNEL3, name: 'general', type: 0 }] },
+      ],
+      users: [
+        { id: USER, username: 'Addo' },
+        { id: GUEST, username: 'Guest' },
+      ],
+    })
+    await discord.start()
+    rest = createSharedRestClient({ token: discord.botToken, apiBase: `${discord.restUrl}/v10` })
+
+    rowMap.set(channelBindingKey({ applicationId: BOT, guildId: GUILD, channelId: CHANNEL }), {
+      workspaceId: 'ws-1', revision: 1, boundBy: USER, boundAtMs: 1,
+    })
+    rowMap.set(channelBindingKey({ applicationId: BOT, guildId: GUILD2, channelId: CHANNEL2 }), {
+      workspaceId: 'ws-2', revision: 1, boundBy: USER, boundAtMs: 1,
+    })
+
+    const sharedRegistry = createComponentRegistry()
+    const interactionRouter = createInteractionRouter({
+      copy: createCopy(),
+      policy: () => ({
+        allowedGuildIds: [GUILD, GUILD2],
+        memberUserIds: [USER],
+        memberRoleIds: [],
+        administratorUserIds: [USER],
+        administratorRoleIds: [],
+        deniedUserIds: [],
+        deniedRoleIds: [],
+        hostOperatorUserIds: [],
+      }),
+      applicationId: () => BOT,
+      registry: sharedRegistry,
+      approvals: createApprovalStore({ get: () => undefined, put: async () => {} }),
+      approvalRespondPort: { respond: () => Promise.resolve({ outcome: 'confirmed' as const }) },
+      turnTracker: createTurnTracker(),
+      queueSnapshots: new Map(),
+      forgetGuild: () => Promise.resolve(),
+      adapterVersion: () => "test",
+      adapterStatus: () => "connected",
+      componentFollowUp: (_interactionId, _interactionToken, content) => {
+        followups.push({ channelId: '', content })
+        return Promise.resolve()
+      },
+      disableControl: () => Promise.resolve(),
+      handleQuestionComponent: input => handleSelectInput({
+        registry: sharedRegistry,
+        store: createQuestionStore(),
+        port: { respond: () => Promise.resolve({ outcome: 'confirmed' as const }) },
+        nowMs: () => Date.now(),
+      } as unknown as Parameters<typeof handleSelectInput>[0], input),
+      handleQuestionModal: input => handleModalSubmit({
+        registry: sharedRegistry,
+        store: createQuestionStore(),
+        port: { respond: () => Promise.resolve({ outcome: 'confirmed' as const }) },
+        nowMs: () => Date.now(),
+      } as unknown as Parameters<typeof handleSelectInput>[0], input),
+      dsh: {
+        cancel: () => Promise.resolve({ outcome: 'accepted' as const }),
+        steer: () => Promise.resolve({ outcome: 'accepted' as const }),
+        removeQueueItem: () => Promise.resolve({ outcome: 'accepted' as const }),
+        readWorkspaceDetail: (reference: string) => {
+          const id = reference
+          return Promise.resolve({
+            outcome: 'found' as const,
+            workspace: { id, title: id === 'ws-2' ? 'ws-two' : 'tmp', path: `/tmp/${id}` },
+          })
+        },
+      },
+      catalogPort: { listWorkspaces: () => Promise.resolve({ outcome: 'completed' as const, workspaces: [], archivedSessionIds: [] }) },
+      resolver: { resolve: () => Promise.resolve({ outcome: 'stale' as const }) },
+      channelBinding: (guildId, cid) => rowMap.get(channelBindingKey({ applicationId: BOT, guildId, channelId: cid })),
+      findBoundChannelFor: () => undefined,
+      sessionForThread: () => undefined,
+      ensureWorkspaceChannel: () => Promise.resolve(undefined),
+      rest: () => Promise.resolve(rest),
+      resumeCandidates: () => Promise.resolve({ outcome: 'ok' as const, options: [] }),
+      resumeSession: () => Promise.resolve({ outcome: 'failed' as const }),
+      modelSelectOperatorOnly: () => false,
+      permissionSelectOperatorOnly: () => true,
+      permission: {
+        catalog: () => Promise.resolve({ outcome: 'completed' as const, entries: [
+          { value: 'read-only', name: 'read-only' },
+          { value: 'workspace-write', name: 'workspace-write' },
+          { value: 'danger-full-access', name: 'danger-full-access' },
+        ] }),
+        current: () => Promise.resolve({ outcome: 'completed' as const, preset: 'workspace-write' }),
+        set: (_sessionId: string, preset: string) => Promise.resolve({ outcome: 'completed' as const, preset }),
+      },
+      model: {
+        models: () => Promise.resolve({
+          outcome: 'completed' as const,
+          models: {
+            current: { provider: 'deepseek', model: 'ds-v3' },
+            routable: true,
+            groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'ds-v3', name: 'V3' }] }],
+            failures: [],
+          },
+        }),
+        selectModel: () => Promise.resolve({ outcome: 'completed' as const, selected: { provider: 'deepseek', model: 'ds-v3' } }),
+      },
+      purgeChannelBinding: async () => {},
+      log: () => {},
+      warn: () => {},
+    })
+
+    runtimeRef.current = startDiscordAdapter({
+      tokenProvider: () => Promise.resolve(discord.botToken),
+      socketFactory: twinSocket,
+      logger: { warn: () => {} },
+      policy: () => ({
+        allowedGuildIds: [GUILD, GUILD2],
+        memberUserIds: [USER],
+        memberRoleIds: [],
+        administratorUserIds: [USER],
+        administratorRoleIds: [],
+        deniedUserIds: [],
+        deniedRoleIds: [],
+        hostOperatorUserIds: [],
+      }),
+      selfUserIdProvider: () => Promise.resolve(BOT),
+      intents: (1 << 0) | (1 << 9) | (1 << 15),
+      applicationId: () => BOT,
+      mainline: {
+        admitMention: request => {
+          admissions.push({ ...request })
+          return Promise.resolve({
+            outcome: 'admitted' as const,
+            threadId: request.messageId,
+            sessionId: `sess-${String(admissions.length)}`,
+          })
+        },
+        continueInThread: request => {
+          continuations.push({ ...request })
+          return Promise.resolve({ outcome: 'queued' as const })
+        },
+      },
+      gatewayUrl: `${discord.gatewayUrl}?v=10&encoding=json`,
+      bindings: {
+        workspaceForChannel: (guildId, cid) =>
+          rowMap.get(channelBindingKey({ applicationId: BOT, guildId, channelId: cid }))?.workspaceId,
+        sessionForThread: () => undefined,
+      },
+      unboundNotice: request => {
+        notices.push({ channelId: request.channelId, audience: request.audience })
+        void rest.request('POST', `/channels/${request.channelId}/messages`, { content: '💡 unbound' })
+      },
+      approvals: createApprovalStore({ get: () => undefined, put: async () => {} }),
+      questions: createQuestionStore(),
+      status: createAdapterStatusTracker(),
+      routeInteraction: (event, token) => {
+        if (event.kind !== 'interaction') return
+        return interactionRouter.route(event, token)
+      },
+    })
+    await new Promise(resolve => { setTimeout(resolve, 500) })
+  }, 20_000)
+
+  afterAll(async () => {
+    runtimeRef.current?.dispose()
+    await discord.stop()
+  })
+
+  it('admits each allowed guild against its own binding', async () => {
+    await discord.channel(CHANNEL).user(USER).sendMessage({ content: `<@${BOT}> task for g1` })
+    await discord.channel(CHANNEL2).user(USER).sendMessage({ content: `<@${BOT}> task for g2` })
+    await new Promise(resolve => { setTimeout(resolve, 400) })
+
+    expect(admissions).toHaveLength(2)
+    expect(admissions[0]).toMatchObject({ guildId: GUILD, channelId: CHANNEL, workspaceId: 'ws-1' })
+    expect(admissions[1]).toMatchObject({ guildId: GUILD2, channelId: CHANNEL2, workspaceId: 'ws-2' })
+  })
+
+  it('drops a mention from a guild outside the allowlist without notice or DSH calls', async () => {
+    await discord.channel(CHANNEL3).user(USER).sendMessage({ content: `<@${BOT}> g3 should not exist` })
+    await new Promise(resolve => { setTimeout(resolve, 400) })
+
+    expect(admissions).toHaveLength(2)
+    expect(notices).toHaveLength(0)
+    expect(followups).toHaveLength(0)
+  })
+
+  it('does not admit an unauthorized member of an allowed guild', async () => {
+    await discord.channel(CHANNEL).user(GUEST).sendMessage({ content: `<@${BOT}> guest should not pass` })
+    await new Promise(resolve => { setTimeout(resolve, 400) })
+
+    expect(admissions).toHaveLength(2)
+    expect(notices).toHaveLength(0)
+  })
+
+  it('filters bot-authored messages even when they mention the bot', async () => {
+    await discord.channel(CHANNEL).user(BOT).sendMessage({ content: `<@${BOT}> bot echo` })
+    await new Promise(resolve => { setTimeout(resolve, 400) })
+
+    expect(admissions).toHaveLength(2)
+  })
+
+  it('scopes /project info to the calling guild binding', async () => {
+    // The reply rides the interaction webhook, so it lands as a channel
+    // message on the twin wire.
+    const interaction = await discord.simulateSlashCommand({
+      channelId: CHANNEL, userId: USER, name: 'project',
+      options: [{ name: 'info', type: 1 }],
+    })
+    await discord.channel(CHANNEL).waitForInteractionAck({ interactionId: interaction.id })
+    const g1Reply = await discord.channel(CHANNEL).waitForMessage({
+      predicate: message => message.content.includes('Path:'),
+    })
+    expect(g1Reply.content).toContain('tmp')
+    expect(g1Reply.content).toContain('/tmp/ws-1')
+    expect(g1Reply.content).not.toContain('ws-two')
+
+    const interaction2 = await discord.simulateSlashCommand({
+      channelId: CHANNEL2, guildId: GUILD2, userId: USER, name: 'project',
+      options: [{ name: 'info', type: 1 }],
+    })
+    await discord.channel(CHANNEL2).waitForInteractionAck({ interactionId: interaction2.id })
+    const g2Reply = await discord.channel(CHANNEL2).waitForMessage({
+      predicate: message => message.content.includes('Path:'),
+    })
+    expect(g2Reply.content).toContain('ws-two')
+    expect(g2Reply.content).toContain('/tmp/ws-2')
+    expect(g2Reply.content).not.toContain('ws-1')
+  }, 20_000)
+})
+
+  const enThreadSessions = new Map<string, string>()
+  const enOperators: string[] = []
+describe('twin smoke: English copy path (16.25)', () => {
+  const GUILD_EN = '333333333333333336'
+  const CHANNEL_EN = '444444444444444448'
+  const GUEST = '222222222222222223'
+  let discord: DigitalDiscord
+  let rest: SharedRestClient
+  const runtimeRef: { current: DiscordAdapterRuntime | undefined } = { current: undefined }
+
+  beforeAll(async () => {
+    discord = new DigitalDiscord({
+      botToken: 'twin-test-token',
+      botUser: { id: BOT, username: 'dsh' },
+      dbUrl: ':memory:',
+      guilds: [{ id: GUILD_EN, name: 'G-en', channels: [{ id: CHANNEL_EN, name: 'general', type: 0 }] }],
+      users: [{ id: GUEST, username: 'Guest' }],
+    })
+    await discord.start()
+    // The administrator gate rides the wire permissions; demote the only
+    // member so the denial paths below are actually exercised.
+    await discord.prisma.guildMember.update({
+      where: { guildId_userId: { guildId: GUILD_EN, userId: GUEST } },
+      data: { permissions: '0' },
+    })
+    rest = createSharedRestClient({ token: discord.botToken, apiBase: `${discord.restUrl}/v10` })
+
+    const sharedRegistry = createComponentRegistry()
+    const interactionRouter = createInteractionRouter({
+      copy: createCopy(),
+      policy: () => ({
+        allowedGuildIds: [GUILD_EN],
+        memberUserIds: [GUEST],
+        memberRoleIds: [],
+        administratorUserIds: [],
+        administratorRoleIds: [],
+        deniedUserIds: [],
+        deniedRoleIds: [],
+        hostOperatorUserIds: enOperators,
+      }),
+      applicationId: () => BOT,
+      registry: sharedRegistry,
+      approvals: createApprovalStore({ get: () => undefined, put: async () => {} }),
+      approvalRespondPort: { respond: () => Promise.resolve({ outcome: 'confirmed' as const }) },
+      turnTracker: createTurnTracker(),
+      queueSnapshots: new Map(),
+      forgetGuild: () => Promise.resolve(),
+      adapterVersion: () => "test",
+      adapterStatus: () => "connected",
+      componentFollowUp: () => Promise.resolve(),
+      disableControl: () => Promise.resolve(),
+      handleQuestionComponent: input => handleSelectInput({
+        registry: sharedRegistry,
+        store: createQuestionStore(),
+        port: { respond: () => Promise.resolve({ outcome: 'confirmed' as const }) },
+        nowMs: () => Date.now(),
+      } as unknown as Parameters<typeof handleSelectInput>[0], input),
+      handleQuestionModal: input => handleModalSubmit({
+        registry: sharedRegistry,
+        store: createQuestionStore(),
+        port: { respond: () => Promise.resolve({ outcome: 'confirmed' as const }) },
+        nowMs: () => Date.now(),
+      } as unknown as Parameters<typeof handleSelectInput>[0], input),
+      dsh: {
+        cancel: () => Promise.resolve({ outcome: 'accepted' as const }),
+        steer: () => Promise.resolve({ outcome: 'accepted' as const }),
+        removeQueueItem: () => Promise.resolve({ outcome: 'accepted' as const }),
+        readWorkspaceDetail: () => Promise.resolve({
+          outcome: 'stale' as const,
+        }),
+      },
+      catalogPort: { listWorkspaces: () => Promise.resolve({ outcome: 'completed' as const, workspaces: [], archivedSessionIds: [] }) },
+      resolver: { resolve: () => Promise.resolve({ outcome: 'stale' as const }) },
+      channelBinding: () => undefined,
+      findBoundChannelFor: () => undefined,
+      sessionForThread: (_guildId, threadId) => enThreadSessions.get(threadId),
+      ensureWorkspaceChannel: () => Promise.resolve(undefined),
+      rest: () => Promise.resolve(rest),
+      resumeCandidates: () => Promise.resolve({ outcome: 'ok' as const, options: [] }),
+      resumeSession: () => Promise.resolve({ outcome: 'failed' as const }),
+      modelSelectOperatorOnly: () => false,
+      permissionSelectOperatorOnly: () => true,
+      permission: {
+        catalog: () => Promise.resolve({ outcome: 'completed' as const, entries: [
+          { value: 'read-only', name: 'read-only' },
+          { value: 'workspace-write', name: 'workspace-write' },
+          { value: 'danger-full-access', name: 'danger-full-access' },
+        ] }),
+        current: () => Promise.resolve({ outcome: 'completed' as const, preset: 'workspace-write' }),
+        set: (_sessionId: string, preset: string) => Promise.resolve({ outcome: 'completed' as const, preset }),
+      },
+      model: {
+        models: () => Promise.resolve({
+          outcome: 'completed' as const,
+          models: {
+            current: { provider: 'deepseek', model: 'ds-v3' },
+            routable: true,
+            groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'ds-v3', name: 'V3' }] }],
+            failures: [],
+          },
+        }),
+        selectModel: () => Promise.resolve({ outcome: 'completed' as const, selected: { provider: 'deepseek', model: 'ds-v3' } }),
+      },
+      purgeChannelBinding: async () => {},
+      log: () => {},
+      warn: () => {},
+    })
+
+    runtimeRef.current = startDiscordAdapter({
+      tokenProvider: () => Promise.resolve(discord.botToken),
+      socketFactory: twinSocket,
+      logger: { warn: () => {} },
+      policy: () => ({
+        allowedGuildIds: [GUILD_EN],
+        memberUserIds: [GUEST],
+        memberRoleIds: [],
+        administratorUserIds: [],
+        administratorRoleIds: [],
+        deniedUserIds: [],
+        deniedRoleIds: [],
+        hostOperatorUserIds: [],
+      }),
+      selfUserIdProvider: () => Promise.resolve(BOT),
+      intents: (1 << 0) | (1 << 9) | (1 << 15),
+      applicationId: () => BOT,
+      mainline: {
+        admitMention: request => Promise.resolve({
+          outcome: 'admitted' as const,
+          threadId: request.messageId,
+          sessionId: `sess-en-${request.messageId.slice(-4)}`,
+        }),
+        continueInThread: () => Promise.resolve({ outcome: 'queued' as const }),
+      },
+      gatewayUrl: `${discord.gatewayUrl}?v=10&encoding=json`,
+      bindings: {
+        workspaceForChannel: () => undefined,
+        sessionForThread: () => undefined,
+      },
+      approvals: createApprovalStore({ get: () => undefined, put: async () => {} }),
+      questions: createQuestionStore(),
+      status: createAdapterStatusTracker(),
+      routeInteraction: (event, token) => {
+        if (event.kind !== 'interaction') return
+        return interactionRouter.route(event, token)
+      },
+    })
+    await new Promise(resolve => { setTimeout(resolve, 500) })
+  }, 20_000)
+
+  afterAll(async () => {
+    runtimeRef.current?.dispose()
+    await discord.stop()
+  })
+
+  it('/permission confirm flow renders the English risk copy and disables on settle', async () => {
+    // A bound task thread for the session-scoped command (en copy 16.61).
+    const source = await discord.channel(CHANNEL_EN).user(GUEST).sendMessage({ content: 'en permission test' })
+    const made = await rest.request<{ id?: string } | undefined>(
+      'POST', `/channels/${CHANNEL_EN}/messages/${source.id}/threads`,
+      { name: 'en permission test', type: 11, auto_archive_duration: 1440 },
+    )
+    expect(made.outcome).toBe('completed')
+    const enThread = made.outcome === 'completed' && typeof made.body?.id === 'string' ? made.body.id : ''
+    expect(enThread).not.toBe('')
+    enThreadSessions.set(enThread, 'sess-en-perm')
+    // The default operator gate stays exercised: raise GUEST for this test,
+    // then restore the plain-member posture the later cases rely on.
+    enOperators.push(GUEST)
+
+    const interaction = await discord.simulateSlashCommand({
+      channelId: enThread, userId: GUEST, name: 'permission',
+      options: [{ name: 'set', type: 1, options: [{ name: 'preset', type: 3, value: 'danger-full-access' }] }],
+    })
+    await discord.channel(enThread).waitForInteractionAck({ interactionId: interaction.id })
+    const prompt = await discord.channel(enThread).waitForMessage({
+      predicate: message => message.content.includes('Enable "Full access"?'),
+    })
+    expect(prompt.content).toContain('sensitive operations')
+    const row = (prompt.components?.[0] as { components?: Array<{ custom_id?: string; label?: string }> } | undefined)?.components ?? []
+    expect(row.map(button => button.label)).toEqual(['I understand the risk, enable', 'Cancel'])
+    const confirmId = row[0]?.custom_id
+    expect(typeof confirmId).toBe('string')
+
+    await discord.simulateButtonClick({ channelId: enThread, userId: GUEST, messageId: prompt.id, customId: confirmId ?? '' })
+    await discord.channel(enThread).waitForMessage({
+      predicate: message => message.content.includes('Permission mode switched: Full access'),
+    })
+    await new Promise(resolve => { setTimeout(resolve, 400) })
+    const settled = (await discord.channel(enThread).getMessages()).find(message => message.id === prompt.id)
+    const settledRow = (settled?.components?.[0] as { components?: Array<{ disabled?: boolean }> } | undefined)?.components ?? []
+    expect(settledRow.map(button => button.disabled)).toEqual([true, true])
+    enOperators.length = 0
+    // (The durable-event system line is covered by live-render unit tests
+    // and the real-machine run; this harness has no DSH mux.)
+  }, 20_000)
+
+  it('denies bind to a plain member with the English admin-only copy', async () => {
+    const interaction = await discord.simulateSlashCommand({
+      channelId: CHANNEL_EN, userId: GUEST, name: 'project',
+      options: [{ name: 'bind', type: 1, options: [{ name: 'workspace', type: 3, value: 'ws-1' }] }],
+    })
+    await discord.channel(CHANNEL_EN).waitForInteractionAck({ interactionId: interaction.id })
+    const reply = await discord.channel(CHANNEL_EN).waitForMessage({
+      predicate: message => message.content.includes('Only workspace administrators can bind channels.'),
+    })
+    expect((reply.flags ?? 0) & 64).toBe(64)
+  }, 20_000)
+
+  it('answers /stop outside a session thread with the English thread copy', async () => {
+    const interaction = await discord.simulateSlashCommand({
+      channelId: CHANNEL_EN, userId: GUEST, name: 'stop', options: [],
+    })
+    await discord.channel(CHANNEL_EN).waitForInteractionAck({ interactionId: interaction.id })
+    const reply = await discord.channel(CHANNEL_EN).waitForMessage({
+      predicate: message => message.content.includes('not an adapter-owned session thread'),
+    })
+    expect((reply.flags ?? 0) & 64).toBe(64)
+  }, 20_000)
+})

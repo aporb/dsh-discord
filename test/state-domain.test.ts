@@ -1,0 +1,230 @@
+/**
+ * Durable-state foundation tests (6.1): key codecs for the two binding
+ * families and the versioned domain spec they validate against.
+ *
+ * Keys: `app:<applicationId>:guild:<guildId>:channel:<channelId>` and
+ * `app:<applicationId>:guild:<guildId>:thread:<threadId>`. Snowflake ids never
+ * contain `:`, so the shape is unambiguous and guild-scoped scans derive from
+ * parsed parts instead of fragile prefixes.
+ *
+ * Records are zod-strict at the durable boundary: unknown fields reject, so
+ * newer-format state fails closed instead of half-decoding (6.7).
+ */
+
+import { describe, expect, it, vi } from 'vitest'
+
+import {
+  defineDomain as upstreamDefineDomain,
+  domainTable as upstreamDomainTable,
+} from '@deepseek-ai/dsh-storage-domain'
+import { z } from 'zod'
+
+import {
+  CHANNEL_BINDINGS_TABLE,
+  DISCORD_DOMAIN_NAME,
+  DISCORD_DOMAIN_VERSION,
+  THREAD_BINDINGS_TABLE,
+  channelBindingKey,
+  defineDomain,
+  discordDomainSpec,
+  domainTable,
+  parseChannelBindingKey,
+  parseThreadBindingKey,
+  threadBindingKey,
+  INTENTS_TABLE,
+} from '../src/state/domain.js'
+import { ChannelBindingRecord, ThreadBindingRecord } from '../src/state/records.js'
+
+const APP = '111111111111111111'
+const GUILD = '333333333333333333'
+const CHANNEL = '444444444444444444'
+const THREAD = '555555555555555555'
+
+describe('binding key codecs', () => {
+  it('builds and parses channel binding keys round-trip', () => {
+    const key = channelBindingKey({ applicationId: APP, guildId: GUILD, channelId: CHANNEL })
+    expect(key).toBe(`app:${APP}:guild:${GUILD}:channel:${CHANNEL}`)
+    expect(parseChannelBindingKey(key)).toEqual({ applicationId: APP, guildId: GUILD, channelId: CHANNEL })
+  })
+
+  it('builds and parses thread binding keys round-trip', () => {
+    const key = threadBindingKey({ applicationId: APP, guildId: GUILD, threadId: THREAD })
+    expect(key).toBe(`app:${APP}:guild:${GUILD}:thread:${THREAD}`)
+    expect(parseThreadBindingKey(key)).toEqual({ applicationId: APP, guildId: GUILD, threadId: THREAD })
+  })
+
+  it('never cross-parses the two key families', () => {
+    const channelKey = channelBindingKey({ applicationId: APP, guildId: GUILD, channelId: CHANNEL })
+    const threadKey = threadBindingKey({ applicationId: APP, guildId: GUILD, threadId: THREAD })
+    expect(parseThreadBindingKey(channelKey)).toBeUndefined()
+    expect(parseChannelBindingKey(threadKey)).toBeUndefined()
+  })
+
+  it('rejects malformed keys instead of guessing', () => {
+    for (const key of [
+      '',
+      'app:guild:channel',
+      `app:${APP}:guild:${GUILD}:channel:`,
+      `guild:${GUILD}:channel:${CHANNEL}`,
+      `app:${APP}:guild::channel:${CHANNEL}`,
+      'xapp:1:guild:2:channel:3',
+    ]) {
+      expect(parseChannelBindingKey(key), key).toBeUndefined()
+      expect(parseThreadBindingKey(key), key).toBeUndefined()
+    }
+  })
+})
+
+describe('binding record schemas', () => {
+  it('accepts a valid channel binding record', () => {
+    const result = ChannelBindingRecord.safeParse({
+      workspaceId: 'ws-1',
+      revision: 3,
+      boundBy: '555555555555555555',
+      boundAtMs: 1_000,
+    })
+    expect(result.success).toBe(true)
+  })
+
+  it('rejects out-of-contract channel binding records', () => {
+    for (const record of [
+      {},
+      { workspaceId: '', revision: 1, boundBy: '555555555555555555', boundAtMs: 1_000 },
+      { workspaceId: 'ws-1', revision: 0, boundBy: '555555555555555555', boundAtMs: 1_000 },
+      { workspaceId: 'ws-1', revision: 1.5, boundBy: '555555555555555555', boundAtMs: 1_000 },
+      { workspaceId: 'ws-1', revision: 1, boundBy: '555555555555555555' },
+      { workspaceId: 'ws-1', revision: 1, boundBy: '555555555555555555', boundAtMs: 'later' },
+      // Unknown fields reject: newer formats fail closed (6.7).
+      { workspaceId: 'ws-1', revision: 1, boundBy: '5', boundAtMs: 1, mystery: true },
+    ]) {
+      const result = ChannelBindingRecord.safeParse(record)
+      expect(result.success, JSON.stringify(record)).toBe(false)
+    }
+  })
+
+  it('accepts a valid thread binding record and rejects broken ones', () => {
+    const valid = {
+      sessionId: 'sess-1',
+      workspaceId: 'ws-1',
+      revision: 1,
+      createdBy: '555555555555555555',
+      createdAtMs: 2_000,
+    }
+    expect(ThreadBindingRecord.safeParse(valid).success).toBe(true)
+    expect(ThreadBindingRecord.safeParse({ ...valid, sessionId: '' }).success).toBe(false)
+    expect(ThreadBindingRecord.safeParse({ ...valid, revision: -1 }).success).toBe(false)
+    expect(ThreadBindingRecord.safeParse({ ...valid, extra: 1 }).success).toBe(false)
+  })
+
+  it('round-trips the optional render watermark (replay-fence-and-user-input)', () => {
+    const legacy = {
+      sessionId: 'sess-1',
+      workspaceId: 'ws-1',
+      revision: 3,
+      createdBy: '555555555555555555',
+      createdAtMs: 2_000,
+    }
+    // Legacy records (written before the field existed) keep parsing.
+    expect(ThreadBindingRecord.safeParse(legacy).success).toBe(true)
+    const persisted = ThreadBindingRecord.parse({ ...legacy, renderedSeq: 42 })
+    expect(persisted.renderedSeq).toBe(42)
+    // The watermark is a non-negative integer; negatives fail closed.
+    expect(ThreadBindingRecord.safeParse({ ...legacy, renderedSeq: -1 }).success).toBe(false)
+    expect(ThreadBindingRecord.safeParse({ ...legacy, renderedSeq: '42' }).success).toBe(false)
+  })
+})
+
+describe('domain spec', () => {
+  it('uses a storage-legal name and a positive integer version', () => {
+    expect(DISCORD_DOMAIN_NAME).toMatch(/^[a-z][a-z0-9_]*$/)
+    expect(DISCORD_DOMAIN_VERSION).toBe(1)
+  })
+
+  it('declares exactly the binding and intent tables', () => {
+    expect(Object.keys(discordDomainSpec.tables).sort()).toEqual(
+      [CHANNEL_BINDINGS_TABLE, THREAD_BINDINGS_TABLE, INTENTS_TABLE].sort(),
+    )
+    expect(discordDomainSpec.version).toBe(DISCORD_DOMAIN_VERSION)
+  })
+
+  it('opens through the facility and closes via the returned domain', async () => {
+    const { openDiscordDomain } = await import('../src/state/domain.js')
+    const close = vi.fn((): Promise<void> => Promise.resolve())
+    const fakeDomain = { name: DISCORD_DOMAIN_NAME, close }
+    const facility = { open: vi.fn((): Promise<typeof fakeDomain> => Promise.resolve(fakeDomain)) }
+
+    const domain = await openDiscordDomain(facility as never)
+    expect(facility.open).toHaveBeenCalledWith(discordDomainSpec)
+    expect(domain.name).toBe(DISCORD_DOMAIN_NAME)
+    await domain.close()
+    expect(close).toHaveBeenCalledTimes(1)
+  })
+})
+
+// 16.106: the plugin mirrors defineDomain/domainTable instead of depending on
+// the package (a shipped copy hoisted over the profile tree and tripped the
+// host's exact-version gate on every upgrade). This block keeps the mirror
+// honest against the real package — accept-for-accept, reject-for-reject —
+// so an upstream semantics change fails here when the devDependency bumps.
+describe('mirrored domain spec helpers drift-guard (16.106)', () => {
+  /** Capture accept (returning the same reference) vs reject as comparable values. */
+  function outcome(apply: () => unknown): unknown {
+    try {
+      const value = apply()
+      return { ok: true, returned: value }
+    } catch {
+      return { ok: false }
+    }
+  }
+
+  /** One base valid spec the malformed variants below mutate. */
+  function baseSpec(tables: Record<string, unknown> = { bindings: domainTable(z.object({ ok: z.boolean() })) }): Record<string, unknown> {
+    return { name: 'dsh_discord', version: 1, tables }
+  }
+
+  it('the shipped spec is valid under the real upstream validator', () => {
+    // The strongest single tripwire: whatever `dsh-storage-domain` currently
+    // considers a legal domain, our inlined declaration must still pass it.
+    expect(upstreamDefineDomain(discordDomainSpec)).toBe(discordDomainSpec)
+  })
+
+  it('domainTable mirrors the upstream plain runtime value', () => {
+    const schema = z.object({ revision: z.number().int() })
+    expect(outcome(() => domainTable(schema))).toEqual(outcome(() => upstreamDomainTable(schema)))
+    expect(domainTable(schema)).toEqual({ valueSchema: schema })
+    expect(domainTable(schema).valueSchema).toBe(schema)
+  })
+
+  const malformedVariants: readonly (readonly [string, unknown])[] = [
+    ['uppercase domain name', { ...baseSpec(), name: 'DSH_discord' }],
+    ['leading-digit domain name', { ...baseSpec(), name: '1dsh' }],
+    ['negative version', { ...baseSpec(), version: -1 }],
+    ['fractional version', { ...baseSpec(), version: 1.5 }],
+    ['compatibleVersions entry not below version', { ...baseSpec(), version: 2, compatibleVersions: [2] }],
+    ['compatibleVersions negative entry', { ...baseSpec(), version: 2, compatibleVersions: [-1] }],
+    ['unknown layout', { ...baseSpec(), layout: 'both' }],
+    ['unknown invalidRecords policy', { ...baseSpec(), invalidRecords: 'drop' }],
+    ['illegal table name', baseSpec({ 'Channel-Bindings': domainTable(z.object({})) })],
+    ['nullable global schema', { ...baseSpec(), global: { schema: z.nullable(z.string()), initial: 'x' } }],
+  ]
+
+  for (const [label, spec] of malformedVariants) {
+    it(`mirrors upstream rejection: ${label}`, () => {
+      expect(outcome(() => defineDomain(spec as never))).toEqual(outcome(() => upstreamDefineDomain(spec as never)))
+    })
+  }
+
+  const acceptedVariants: readonly (readonly [string, unknown])[] = [
+    ['compatibleVersions below version', { ...baseSpec(), version: 2, compatibleVersions: [0, 1] }],
+    ['per-record layout', { ...baseSpec(), layout: 'per-record' }],
+    ['backup-and-skip policy', { ...baseSpec(), invalidRecords: 'backup-and-skip' }],
+    ['non-nullable global schema', { ...baseSpec(), global: { schema: z.string(), initial: 'x' } }],
+  ]
+
+  for (const [label, spec] of acceptedVariants) {
+    it(`mirrors upstream acceptance and returns the same reference: ${label}`, () => {
+      expect(outcome(() => defineDomain(spec as never))).toEqual(outcome(() => upstreamDefineDomain(spec as never)))
+      expect(defineDomain(spec as never)).toBe(spec)
+    })
+  }
+})

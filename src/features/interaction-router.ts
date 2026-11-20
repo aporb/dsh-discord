@@ -1,0 +1,1590 @@
+/**
+ * The interaction router (extracted from the Host composition root so the
+ * whole command/component surface is testable against the Discord API twin).
+ * Every path re-checks authorization where the event alone cannot prove it
+ * (workspace-administrator level, catalog freshness), answers interactions
+ * through the deferred-ack + ephemeral-followup pattern, and maps every DSH
+ * outcome onto caller-facing copy without ever retrying.
+ */
+
+import type { ComponentRegistry } from '../discord/components.js'
+import type { SharedRestClient } from '../discord/rest.js'
+import { evaluateAuthorization, levelAtLeast, type PolicyTable } from '../policy/authorization.js'
+import { ALLOWED_MENTIONS_NONE, DISCORD_SUPPRESS_NOTIFICATIONS_FLAG, OUTBOUND_EPHEMERAL_FLAGS } from '../policy/disclosure.js'
+import { workspaceAutocompleteChoices, createProjectListView, type ProjectListPort } from './project-list.js'
+import { projectInfo } from './project-info.js'
+import type { WorkspaceResolver } from './project-bind.js'
+import type { CancelOutcome, PromptOutcome, QueueRemoveOutcome, WorkspaceDetailOutcome } from '../dsh/host-face.js'
+import { planSteer } from './steer-control.js'
+import { planStop } from './stop-control.js'
+import type { TurnTracker } from './turn-ownership.js'
+import { handleApprovalClick, type ApprovalClickOutcome, type DshApprovalRespondPort } from './approval-routing.js'
+import { applyModelSelection, type DshModelPort, type ModelApplyResult } from './model-control.js'
+import {
+  applyPermissionPreset,
+  requiresConfirmation,
+  showPermission,
+  type DshPermissionPort,
+  type PermissionApplyResult,
+} from './permission-control.js'
+import { permissionPresetLabel } from '../i18n.js'
+import type { QuestionInteractionOutcome } from './question-routing.js'
+import type { ApprovalStore } from './approval-store.js'
+import type { ChannelBinding } from '../state/records.js'
+import type { NormalizedInteraction } from '../gateway/inbound.js'
+import type { CopyTable } from '../i18n.js'
+import { resolveChoiceIndex, sessionChoices, type PickerSessionRow } from './session-picker.js'
+
+/** The DSH faces the control commands submit through (host-face-backed). */
+export interface InteractionDshFace {
+  cancel(sessionId: string): Promise<CancelOutcome>
+  steer(sessionId: string, prompt: string): Promise<PromptOutcome>
+  removeQueueItem(sessionId: string, itemId: string): Promise<QueueRemoveOutcome>
+  readWorkspaceDetail(reference: string): Promise<WorkspaceDetailOutcome>
+}
+
+/** Fork addition: the conversation picker's attach/create outcomes. */
+export type PickerAttachOutcome =
+  | { outcome: 'followed'; threadId: string; title: string }
+  | { outcome: 'already-bound'; threadId: string }
+  | { outcome: 'failed' }
+
+/** Fork addition: the composition root's picker ports. */
+export interface SessionPickerDeps {
+  /** Recent conversations for one Workspace (already workspace-scoped). */
+  sessionChoices(input: { guildId: string; workspaceId: string; path?: string }): Promise<
+    | { outcome: 'ok'; sessions: PickerSessionRow[] }
+    | { outcome: 'unavailable' }
+  >
+  /** Sessions this adapter already follows in a thread (excluded from lists). */
+  boundSessionIds(): ReadonlySet<string>
+  /** Bind this thread to an existing conversation and start the live render. */
+  attach(input: { guildId: string; threadId: string; actorId: string; sessionId: string; workspaceId: string; title?: string }): Promise<PickerAttachOutcome>
+  /** Create a new conversation in the Workspace, bind, and start the render. */
+  create(input: { guildId: string; threadId: string; actorId: string; workspaceId: string }): Promise<PickerAttachOutcome>
+}
+
+export interface InteractionRouterDeps {
+  policy: () => PolicyTable
+  applicationId: () => string
+  /** The shared component registry (render + click routing use one instance). */
+  registry: ComponentRegistry
+  /** Discord-visible copy, resolved per access (language can change live). */
+  copy: CopyTable
+  approvals: ApprovalStore
+  approvalRespondPort: DshApprovalRespondPort
+  turnTracker: TurnTracker
+  /** Latest mux queue snapshots per session — the /queue surface's source. */
+  queueSnapshots: Map<string, Array<{ id: string; summary: string }>>
+  dsh: InteractionDshFace
+  catalogPort: ProjectListPort
+  resolver: WorkspaceResolver
+  channelBinding: (guildId: string, channelId: string) => ChannelBinding | undefined
+  findBoundChannelFor: (guildId: string, workspaceId: string) => string | undefined
+  sessionForThread: (guildId: string, threadId: string) => string | undefined
+  ensureWorkspaceChannel: (options: {
+    guildId: string
+    workspaceId: string
+    title: string
+    actorId: string
+  }) => Promise<{ channelId: string; created: boolean } | undefined>
+  /** Delete every adapter-owned record for one guild (DSH untouched). */
+  forgetGuild: (guildId: string) => Promise<void>
+  /** The adapter's own package version (from package.json at load). */
+  adapterVersion: () => string
+  /** One-word connection condition for /info. */
+  adapterStatus: () => string
+  /** Ephemeral failure/guidance followup on a component interaction. */
+  componentFollowUp: (interactionId: string, interactionToken: string, content: string) => Promise<void>
+  /** Retire a rendered control (remove its components on the source message). */
+  disableControl: (key: string) => Promise<void>
+  /** Question select/submit clicks and modal submits (module-tested routing). */
+  handleQuestionComponent: (input: {
+    customId: string
+    userId: string
+    threadId: string
+    values: string[]
+  }) => Promise<QuestionInteractionOutcome>
+  handleQuestionModal: (input: {
+    customId: string
+    userId: string
+    threadId: string
+    text: string
+  }) => Promise<QuestionInteractionOutcome>
+  rest: () => Promise<SharedRestClient | undefined>
+  /**
+   * Delete one channel→Workspace binding row (bind precheck: a bound
+   * channel that Discord no longer has is user intent — purge, then bind
+   * fresh; task 16.37).
+   */
+  purgeChannelBinding: (guildId: string, channelId: string) => Promise<void>
+  /** The session's live model directory + selection mutation (/model surface). */
+  model: DshModelPort
+  /**
+   * /session resume autocomplete candidates: rich Host rows filtered to
+   * non-blank, unbound sessions, title-filtered, newest-first, capped at 25
+   * (16.44).
+   */
+  resumeCandidates: (query: string, workspacePath?: string, archivedSessionIds?: ReadonlySet<string>) => Promise<
+    | { outcome: 'ok'; options: Array<{ label: string; value: string; description?: string }> }
+    | { outcome: 'unavailable' }
+  >
+  /**
+   * Cold-adopt a session into a NEW thread of the bound project channel:
+   * anchor post → message-anchored thread creation → durable thread→session
+   * binding. Already-bound sessions resolve to their existing thread
+   * (16.44).
+   */
+  resumeSession: (input: {
+    sessionId: string
+    workspaceId: string
+    guildId: string
+    parentChannelId: string
+    actorId: string
+  }) => Promise<
+    | { outcome: 'started'; threadId: string }
+    | { outcome: 'already-bound'; threadId: string }
+    | { outcome: 'refused-control-channel' }
+    | { outcome: 'refused-subagent' }
+    | { outcome: 'refused-archived' }
+    | { outcome: 'failed' }
+  >
+  /**
+   * Whether /model select stays Host-operator-only (default). Single-user
+   * deployments flip this so any authorized member can switch (16.42).
+   */
+  modelSelectOperatorOnly: () => boolean
+  /**
+   * Whether /permission set stays Host-operator-only (default true — the
+   * danger-full-access preset strips sandbox AND approval; 16.60).
+   */
+  permissionSelectOperatorOnly: () => boolean
+  /** The live permission-preset catalog + guarded switch (/permission surface). */
+  permission: DshPermissionPort
+  /** Fork addition: conversation picker ports (absent in older test rigs). */
+  picker?: SessionPickerDeps
+  /** Fork addition: open the picker in a fresh or current thread. */
+  openPicker?: (input: { guildId: string; channelId: string; actorId: string }) => Promise<
+    | { outcome: 'opened'; threadId: string }
+    | { outcome: 'unavailable' }
+    | { outcome: 'failed' }
+  >
+  log: (event: string, detail?: unknown) => void
+  warn: (event: string, detail?: unknown) => void
+}
+
+type RouterEvent = NormalizedInteraction
+
+/** Discord interactive-component id for string select menus. */
+const SELECT_MENU = 3
+
+/** `provider/model` — or `provider/model (effort)` when an effort is set. */
+function modelSelectionLabel(selection: { provider: string; model: string; reasoningEffort?: string }): string {
+  return selection.reasoningEffort === undefined
+    ? `${selection.provider}/${selection.model}`
+    : `${selection.provider}/${selection.model} (${selection.reasoningEffort})`
+}
+
+function selectMenuRow(customId: string, placeholder: string, options: Array<{ label: string; value: string; description?: string }>): Array<unknown> {
+  return [{
+    type: 1,
+    components: [{ type: SELECT_MENU, custom_id: customId, placeholder, options, max_values: 1 }],
+  }]
+}
+
+/** The ephemeral outcome line for a /model selection attempt. */
+function renderModelApply(copy: CopyTable, result: ModelApplyResult): string {
+  switch (result.outcome) {
+    case 'applied': return copy.modelApplied(modelSelectionLabel(result.selected))
+    case 'rejected': return copy.modelSelectRejected(result.reason)
+    case 'unknown': return copy.modelSelectUnknown
+    case 'refused':
+      return result.reason === 'not-host-operator' ? copy.modelSelectOperatorOnly
+        : result.reason === 'invalid-reasoning-effort' ? copy.modelInvalidReasoning
+        : copy.modelNotInCatalog
+  }
+}
+
+/** The ephemeral outcome line for a /permission switch attempt. */
+function renderPermissionApply(copy: CopyTable, result: PermissionApplyResult): string {
+  switch (result.outcome) {
+    case 'applied': return copy.permissionApplied(permissionPresetLabel(result.preset, copy))
+    case 'rejected': return copy.permissionRejected(result.reason)
+    case 'unknown': return copy.permissionUnknown
+    case 'refused':
+      return result.reason === 'not-host-operator' ? copy.permissionSelectOperatorOnly : copy.permissionNotInCatalog
+  }
+}
+
+/** One posted permission risk-confirmation prompt, so a settle can gray it out. */
+interface PermissionPromptRecord {
+  /** The ephemeral followup message carrying the confirm/cancel buttons. */
+  messageId: string
+  /** The SLASH interaction's webhook token — the only editor of that followup. */
+  interactionToken: string
+  /** Posted content, replayed verbatim on retire (language stays as posted). */
+  content: string
+  confirmCustomId: string
+  cancelCustomId: string
+  confirmLabel: string
+  cancelLabel: string
+  createdAtMs: number
+}
+
+/** Buttons live while the registry entry does; entries sweep past one extra TTL. */
+const PERMISSION_PROMPT_SWEEP_MS = 20 * 60 * 1000
+
+export function createInteractionRouter(deps: InteractionRouterDeps): {
+  route(event: NormalizedInteraction, interactionToken?: string): Promise<void>
+} {
+  /**
+   * Posted /permission confirmation prompts by custom_id. In-memory only —
+   * a restart forgets both halves together (the registry is memory too),
+   * so a resolved-but-unretired prompt is impossible to click anyway.
+   */
+  const permissionPrompts = new Map<string, PermissionPromptRecord>()
+
+  /** Drop prompt records past their sweep window (never-clicked prompts). */
+  function sweepPermissionPrompts(nowMs: number): void {
+    for (const [customId, record] of permissionPrompts) {
+      if (nowMs - record.createdAtMs > PERMISSION_PROMPT_SWEEP_MS) permissionPrompts.delete(customId)
+    }
+  }
+
+  /** Authorize one interaction against the live policy table. */
+  function authorize(event: RouterEvent) {
+    return evaluateAuthorization(deps.policy(), {
+      guildId: event.guildId,
+      userId: event.actorId,
+      roleIds: event.roleIds,
+      memberPermissions: event.memberPermissions,
+      isBot: event.isBot,
+    })
+  }
+
+  async function routeAutocomplete(event: RouterEvent, interactionToken: string): Promise<void> {
+    if (event.commandName !== 'project' && event.commandName !== 'session' && event.commandName !== 'permission') return
+    // Autocomplete has no deferred-ack form: whatever happens below, Discord
+    // must receive exactly one type-8 answer, even if only empty choices.
+    try {
+      const decision = authorize(event)
+      const choices: Array<{ name: string; value: string; description?: string }> = []
+      const wireOptions = event.data['options'] as Array<{ name: string; options?: Array<{ name: string; value?: string; focused?: boolean }> }> | undefined
+      const sub = Array.isArray(wireOptions) ? wireOptions[0] : undefined
+      const focused = Array.isArray(sub?.options) ? sub.options.find(option => option.focused === true) : undefined
+      const query = typeof focused?.value === 'string' ? focused.value : ''
+      if (decision.allowed && event.commandName === 'session') {
+        // /session resume: live candidates scoped to the bound workspace.
+        try {
+          const binding = deps.channelBinding(event.guildId, event.channelId)
+          const catalog = await deps.catalogPort.listWorkspaces()
+          const workspacePath = binding !== undefined && catalog.outcome === 'completed'
+            ? catalog.workspaces.find(workspace => workspace.id === binding.workspaceId)?.path
+            : undefined
+          const archivedSessionIds = catalog.outcome === 'completed'
+            ? new Set(catalog.archivedSessionIds)
+            : undefined
+          const outcome = await deps.resumeCandidates(query, workspacePath, archivedSessionIds)
+          if (outcome.outcome === 'ok') {
+            choices.push(...outcome.options.slice(0, 25).map(option => (
+              option.description === undefined
+                ? { name: option.label, value: option.value }
+                : { name: option.label, value: option.value, description: option.description }
+            )))
+          }
+        } catch (cause) {
+          deps.warn('discord_autocomplete_sessions_failed', String(cause))
+        }
+      } else if (decision.allowed && event.commandName === 'project') {
+        try {
+          const catalog = await deps.catalogPort.listWorkspaces()
+          if (catalog.outcome === 'completed') {
+            choices.push(...workspaceAutocompleteChoices(catalog.workspaces, query).slice(0, 25))
+          }
+        } catch (cause) {
+          // Malformed catalog rows must degrade to empty choices, never to
+          // an unanswered interaction.
+          deps.warn('discord_autocomplete_catalog_failed', String(cause))
+        }
+      } else if (decision.allowed && event.commandName === 'permission') {
+        // /permission set: live catalog entries, labeled in the current
+        // language; the raw preset key is the value (custom deployments
+        // define their own tables, so nothing is hardcoded).
+        try {
+          const catalog = await deps.permission.catalog()
+          if (catalog.outcome === 'completed') {
+            const lowered = query.trim().toLowerCase()
+            choices.push(...catalog.entries
+              .filter(entry => entry.value !== lowered)
+              .filter(entry => lowered === ''
+                || entry.value.toLowerCase().includes(lowered)
+                || permissionPresetLabel(entry.value, deps.copy).toLowerCase().includes(lowered))
+              .slice(0, 25)
+              .map(entry => ({ name: permissionPresetLabel(entry.value, deps.copy), value: entry.value })))
+          }
+        } catch (cause) {
+          deps.warn('discord_autocomplete_permission_failed', String(cause))
+        }
+      }
+      const rest = await deps.rest()
+      if (rest === undefined) { deps.warn('discord_autocomplete_failed', 'missing-token'); return }
+      const posted = await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, {
+        type: 8,
+        data: { choices },
+      })
+      if (posted.outcome !== 'completed') {
+        deps.log('discord_autocomplete_failed', posted.outcome === 'rejected' ? `HTTP ${String(posted.status)}` : posted.reason)
+      }
+    } catch (cause) {
+      deps.warn('discord_autocomplete_threw', String(cause))
+      const rest = await deps.rest()
+      if (rest !== undefined) {
+        await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, {
+          type: 8,
+          data: { choices: [] },
+        }).catch(() => {})
+      }
+    }
+  }
+
+  async function routeSlashCommand(event: RouterEvent, interactionToken: string): Promise<void> {
+    const rest = await deps.rest()
+    if (rest === undefined) { deps.log('discord_ack_failed', 'missing-token'); return }
+    const ack = await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, { type: 5, data: { flags: 64 } })
+    if (ack.outcome !== 'completed') { deps.log('discord_ack_failed', ack.outcome); return }
+    // Deferred-ack followups must never fail silently: the REST client
+    // resolves (never rejects) 4xx outcomes, so a void'ed call would drop
+    // the failure without a trace. Returns the created message id so
+    // callers can retire controls on the posted message later.
+    const followUp = async (content: string, components?: Array<unknown>): Promise<string | undefined> => {
+      const posted = await rest.request('POST', `/webhooks/${deps.applicationId()}/${interactionToken}`, {
+        content,
+        flags: OUTBOUND_EPHEMERAL_FLAGS,
+        ...(components === undefined ? {} : { components }),
+      })
+      if (posted.outcome !== 'completed') {
+        deps.log('discord_followup_failed', posted.outcome === 'rejected' ? `HTTP ${String(posted.status)}` : posted.reason)
+        return undefined
+      }
+      const messageId = (posted as { body?: { id?: unknown } }).body?.['id']
+      return typeof messageId === 'string' ? messageId : undefined
+    }
+    const buttonRow = (confirmId: string, cancelId: string): Array<unknown> => [{
+      type: 1,
+      components: [
+        { type: 2, style: 3, label: deps.copy.bindConfirmButton, custom_id: confirmId },
+        { type: 2, style: 4, label: deps.copy.bindCancelButton, custom_id: cancelId },
+      ],
+    }]
+    try {
+      if (event.commandName === 'project') {
+        const options = event.data['options'] as Array<{ name: string; options?: Array<{ name: string; value?: string }> }> | undefined
+        const subcommand = Array.isArray(options) ? options[0] : undefined
+        const subName = subcommand?.name
+        if (subName === 'bind') {
+          // Add-project semantics: bind provisions (or reuses)
+          // the Workspace's home channel under the adapter category.
+          // The current channel — e.g. the control channel — is never
+          // captured; only the opaque ws: reference crosses the wire.
+          const decision = authorize(event)
+          if (!decision.allowed || !levelAtLeast(decision.level, 'workspace-administrator')) {
+            await followUp(deps.copy.bindAdminOnly)
+            return
+          }
+          const wireOptions = Array.isArray(subcommand?.options) ? subcommand.options : []
+          const reference = wireOptions.find(option => option.name === 'workspace')?.value
+          if (typeof reference !== 'string' || reference === '') {
+            await followUp(deps.copy.bindUsage)
+            return
+          }
+          const resolvedWorkspace = await deps.resolver.resolve(reference)
+          if (resolvedWorkspace.outcome !== 'found') {
+            await followUp(resolvedWorkspace.outcome === 'stale'
+              ? deps.copy.bindWorkspaceGone
+              : resolvedWorkspace.outcome === 'unknown'
+                ? deps.copy.bindWorkspaceUnknown
+                : deps.copy.bindWorkspaceUnavailable)
+            return
+          }
+          const { id: workspaceId, title } = resolvedWorkspace.workspace
+          const existing = deps.findBoundChannelFor(event.guildId, workspaceId)
+          if (existing !== undefined) {
+            // Idempotent: one workspace, one channel — but only while the
+            // bound channel still exists. A Discord-side deletion is user
+            // intent: purge the stale mapping and bind fresh (16.37). An
+            // unverified surface keeps the idempotent reply, never a purge.
+            const stillLive = await (async (): Promise<boolean | undefined> => {
+              const client = await deps.rest()
+              if (client === undefined) return undefined
+              const listed = await client.request<Array<{ id: string }>>('GET', `/guilds/${event.guildId}/channels`)
+              if (listed.outcome !== 'completed' || !Array.isArray(listed.body)) return undefined
+              return listed.body.some(channel => channel.id === existing)
+            })()
+            if (stillLive === true) {
+              await followUp(deps.copy.bindChannelExists(title, existing))
+              return
+            }
+            if (stillLive === false) await deps.purgeChannelBinding(event.guildId, existing)
+          }
+          const expiresAtMs = Date.now() + 15 * 60 * 1000
+          const confirmId = deps.registry.register({ kind: 'project-bind', action: 'confirm', workspaceId, workspaceTitle: title, guildId: event.guildId, actorId: event.actorId, expiresAtMs })
+          const cancelId = deps.registry.register({ kind: 'project-bind', action: 'cancel', workspaceId, workspaceTitle: title, guildId: event.guildId, actorId: event.actorId, expiresAtMs })
+          deps.log('discord_project_bind_planned', { interactionId: event.interactionId, workspaceId })
+          await followUp(deps.copy.bindConfirmPrompt(title), buttonRow(confirmId, cancelId))
+          return
+        }
+        if (subName === 'list') {
+          deps.log('discord_project_list_start', { interactionId: event.interactionId })
+          const view = await createProjectListView(deps.catalogPort, { selectionId: event.interactionId })
+          if (view.outcome !== 'ok') {
+            await followUp(view.reason === 'workspace-catalog-unknown'
+              ? deps.copy.infoUnknown
+              : deps.copy.infoUnavailable)
+            return
+          }
+          // Names only: the bind option autocompletes live candidates,
+          // so ids never need to be read, copied, or typed. Text surface,
+          // no navigation: over-large catalogs get an honest truncation
+          // line instead of a pager that leads nowhere.
+          const rows = view.items.map(item => `• ${item.label}`)
+          const truncation = view.totalCount > view.items.length
+            ? deps.copy.listTruncated(view.items.length, view.totalCount)
+            : ''
+          await followUp(rows.length === 0 ? deps.copy.listEmpty : [deps.copy.listHeader, ...rows].join('\n') + truncation)
+          return
+        }
+        if (subName === 'info') {
+          // Info describes THIS channel's bound workspace. Any authorized
+          // member sees the identity plus the canonical path (amended
+          // design §3 / 16.1); the response is ephemeral either way.
+          // Deny-first: the refusal is decided before any DSH read.
+          const decision = authorize(event)
+          if (!decision.allowed) {
+            // Refuse identity disclosure to non-members even when bound.
+            await followUp(deps.copy.infoMemberOnly)
+            return
+          }
+          const binding = deps.channelBinding(event.guildId, event.channelId)
+          if (binding === undefined) {
+            // Bind provisions the Workspace's home channel — most
+            // channels, including the control channel, are unbound.
+            await followUp(deps.copy.infoUnboundAllowed)
+            return
+          }
+          const detail = await deps.dsh.readWorkspaceDetail(binding.workspaceId)
+          if (detail.outcome !== 'found') {
+            await followUp(detail.outcome === 'unknown'
+              ? deps.copy.infoUnknown
+              : detail.outcome === 'stale'
+                ? deps.copy.infoStale
+                : deps.copy.infoUnavailable)
+            return
+          }
+          const view = projectInfo({
+            decision,
+            workspace: { id: detail.workspace.id, title: detail.workspace.title, path: detail.workspace.path },
+          })
+          if (view.outcome !== 'info') {
+            await followUp(deps.copy.infoMemberOnly)
+            return
+          }
+          const lines = [
+            `**${view.workspace.label}**`,
+            deps.copy.infoRevision(String(binding.revision), binding.boundBy),
+          ]
+          if (view.workspace.path !== undefined) lines.push(deps.copy.infoPath(view.workspace.path))
+          await followUp(lines.join('\n'))
+          return
+        }
+        await followUp(deps.copy.unknownSubcommand)
+        return
+      }
+      // ── Session control commands (session-control spec) ─────────────
+      // Every control path resolves the calling thread's session binding
+      // first; ownership comes from the turn tracker's request IDs, never
+      // from a session's running status.
+      if (event.commandName === 'stop' || event.commandName === 'steer') {
+        const sessionId = deps.sessionForThread(event.guildId, event.channelId)
+        if (sessionId === undefined) {
+          await followUp(deps.copy.stopNotSessionThread)
+          return
+        }
+        if (event.commandName === 'stop') {
+          const result = await planStop(
+            {
+              cancel: async ({ sessionId: id }) => {
+                const cancelled = await deps.dsh.cancel(id)
+                return cancelled.outcome === 'accepted'
+                  ? { outcome: 'accepted' as const, pendingPreserved: true }
+                  : cancelled.outcome === 'rejected'
+                    ? { outcome: 'rejected' as const, reason: cancelled.reason }
+                    : { outcome: 'unknown' as const }
+              },
+            },
+            deps.turnTracker,
+            { sessionId, threadId: event.channelId },
+          )
+          if (result.outcome === 'refused') {
+            await followUp(result.reason === 'no-active-turn'
+              ? deps.copy.stopNothingRunning
+              : deps.copy.stopNotOwner)
+            return
+          }
+          if (result.outcome === 'cancelled') {
+            await followUp(result.pendingPreserved ? deps.copy.stopStoppedQueuePreserved : deps.copy.stopStopped)
+            return
+          }
+          await followUp(result.outcome === 'rejected'
+            ? deps.copy.stopRejected
+            : deps.copy.stopUnknown)
+          return
+        }
+        // /steer <prompt>
+        const steerText = typeof event.data['options'] === 'object'
+          ? (event.data['options'] as Array<{ name?: unknown; value?: unknown }>).find(option => option.name === 'prompt')?.value
+          : undefined
+        const prompt = typeof steerText === 'string' ? steerText.trim() : ''
+        if (prompt === '') {
+          await followUp(deps.copy.steerUsage)
+          return
+        }
+        const result = await planSteer(
+          {
+            steer: async ({ sessionId: id }) => {
+              const steered = await deps.dsh.steer(id, prompt)
+              return steered.outcome === 'accepted'
+                ? { outcome: 'accepted' as const }
+                : steered.outcome === 'rejected'
+                  ? { outcome: 'rejected' as const, reason: steered.reason }
+                  : { outcome: 'unknown' as const }
+            },
+          },
+          deps.turnTracker,
+          { sessionId, threadId: event.channelId, prompt },
+        )
+        if (result.outcome === 'refused') {
+          await followUp(result.reason === 'no-active-turn'
+            ? deps.copy.steerNothingRunning
+            : deps.copy.steerNotOwner)
+          return
+        }
+        await followUp(result.outcome === 'accepted'
+          ? deps.copy.steerQueued
+          : result.outcome === 'rejected'
+            ? deps.copy.steerRejected
+            : deps.copy.steerUnknown)
+        return
+      }
+      if (event.commandName === 'queue') {
+        const sessionId = deps.sessionForThread(event.guildId, event.channelId)
+        if (sessionId === undefined) {
+          await followUp(deps.copy.queueNotSessionThread)
+          return
+        }
+        const wireOptions = event.data['options'] as Array<{ name?: unknown; options?: Array<{ name?: unknown; value?: unknown }> }> | undefined
+        const sub = Array.isArray(wireOptions) ? wireOptions[0] : undefined
+        if (sub?.name === 'remove') {
+          const raw = Array.isArray(sub.options) ? sub.options.find(option => option.name === 'item')?.value : undefined
+          const reference = typeof raw === 'string' ? raw.trim() : ''
+          if (reference === '') {
+            await followUp(deps.copy.queueRemoveUsage)
+            return
+          }
+          const snapshot = deps.queueSnapshots.get(sessionId)
+          const byPosition = /^\d+$/.test(reference)
+            ? snapshot?.[Number.parseInt(reference, 10) - 1]
+            : snapshot?.find(item => item.id === reference)
+          if (byPosition === undefined) {
+            await followUp(deps.copy.queueItemNotFound)
+            return
+          }
+          const removed = await deps.dsh.removeQueueItem(sessionId, byPosition.id)
+          if (removed.outcome === 'accepted') {
+            await followUp(deps.copy.queueRemoved(byPosition.summary))
+            return
+          }
+          await followUp(removed.outcome === 'rejected'
+            ? deps.copy.queueRemoveRejected
+            : deps.copy.queueRemoveUnknown)
+          return
+        }
+        // /queue list — the mux snapshot cache is the data source.
+        const snapshot = deps.queueSnapshots.get(sessionId)
+        if (snapshot === undefined) {
+          await followUp(deps.copy.queueNoData)
+          return
+        }
+        if (snapshot.length === 0) {
+          await followUp(deps.copy.queueEmpty)
+          return
+        }
+        const rows = snapshot.map((item, index) => `${String(index + 1)}. ${item.summary}`)
+        await followUp([deps.copy.queueHeader, ...rows, '', deps.copy.queueRemoveHint].join('\n'))
+        return
+      }
+      if (event.commandName === 'guild') {
+        const options = event.data['options'] as Array<{ name: string; options?: Array<{ name: string; value?: string }> }> | undefined
+        const subName = Array.isArray(options) ? options[0]?.name : undefined
+        if (subName !== 'forget') {
+          await followUp(deps.copy.unknownSubcommand)
+          return
+        }
+        // Guild forget mutates adapter-owned state for the whole guild:
+        // Host-operator authority ONLY (binding-state spec; decision 16.7).
+        const isOperator = deps.policy().hostOperatorUserIds.includes(event.actorId)
+        if (!isOperator) {
+          await followUp(deps.copy.forgetOperatorOnly)
+          return
+        }
+        const expiresAtMs = Date.now() + 15 * 60 * 1000
+        const confirmId = deps.registry.register({ kind: 'guild-forget', action: 'confirm', guildId: event.guildId, actorId: event.actorId, expiresAtMs })
+        await followUp(deps.copy.forgetConfirmPrompt, [{
+          type: 1,
+          components: [{ type: 2, style: 4, label: deps.copy.forgetConfirmButton, custom_id: confirmId }],
+        }])
+        return
+      }
+      if (event.commandName === 'info') {
+        await followUp(deps.copy.infoLine(deps.adapterVersion(), deps.adapterStatus()))
+        return
+      }
+      if (event.commandName === 'model') {
+        const options = event.data['options'] as Array<{ name: string; options?: Array<{ name: string; value?: string }> }> | undefined
+        const subcommand = Array.isArray(options) ? options[0] : undefined
+        const subName = subcommand?.name
+        const sessionId = deps.sessionForThread(event.guildId, event.channelId)
+        if (sessionId === undefined) {
+          await followUp(deps.copy.modelNeedsThread)
+          return
+        }
+        if (subName === 'select') {
+          // Operator-only by configuration (modelSelectOperatorOnly, default OFF —
+          // decision 16.42): single-user deployments leave it open to members.
+          // Host-wide default selection (design.md §7). A deployment may
+          // relax it for single-user use (16.42).
+          const requireOperator = deps.modelSelectOperatorOnly()
+          const decision = authorize(event)
+          if (!decision.allowed || (requireOperator && decision.level !== 'host-operator')) {
+            await followUp(deps.copy.modelSelectOperatorOnly)
+            return
+          }
+          const wireOptions = Array.isArray(subcommand?.options) ? subcommand.options : []
+          const typedModel = wireOptions.find(option => option.name === 'model')?.value
+          const typedReasoning = wireOptions.find(option => option.name === 'reasoning')?.value
+          if (typeof typedModel === 'string' && typedModel !== '') {
+            // Typed form: `provider/model` plus an optional reasoning
+            // effort, validated against the live catalog before mutation.
+            const separator = typedModel.indexOf('/')
+            if (separator <= 0 || separator === typedModel.length - 1) {
+              await followUp(deps.copy.modelTypedParseFailed)
+              return
+            }
+            const result = await applyModelSelection(deps.model, {
+              decision,
+              sessionId,
+              provider: typedModel.slice(0, separator),
+              model: typedModel.slice(separator + 1),
+              requireHostOperator: requireOperator,
+              ...(typeof typedReasoning === 'string' && typedReasoning !== '' ? { reasoningEffort: typedReasoning } : {}),
+            })
+            await followUp(renderModelApply(deps.copy, result))
+            return
+          }
+          // Interactive cascade, stage 1: the provider.
+          const directory = await deps.model.models(sessionId)
+          if (directory.outcome !== 'completed') {
+            await followUp(deps.copy.modelShowUnavailable)
+            return
+          }
+          if (directory.models.groups.length === 0) {
+            await followUp(deps.copy.modelSelectNoModels)
+            return
+          }
+          const failures = directory.models.failures.length > 0
+            ? deps.copy.modelShowFailures(directory.models.failures.map(failure => failure.name).join(', '))
+            : ''
+          const truncated = directory.models.groups.length > 25
+            ? deps.copy.modelCascadeTruncated(25, directory.models.groups.length)
+            : ''
+          const menuId = deps.registry.register({ kind: 'model', stage: 'provider', sessionId, expiresAtMs: Date.now() + 15 * 60 * 1000 })
+          await followUp(deps.copy.modelCascadeProviderHeader(modelSelectionLabel(directory.models.current), `${failures}${truncated}`), selectMenuRow(menuId, deps.copy.modelCascadeProviderPlaceholder, directory.models.groups.slice(0, 25).map(group => ({
+            label: group.name,
+            value: group.id,
+            description: `${String(group.models.length)} models`,
+          }))))
+          return
+        }
+        // show (default): the member-readable live model directory.
+        const directory = await deps.model.models(sessionId)
+        if (directory.outcome !== 'completed') {
+          await followUp(deps.copy.modelShowUnavailable)
+          return
+        }
+        const current = directory.models.current
+        const selection = current.reasoningEffort === undefined
+          ? `${current.provider}/${current.model}`
+          : `${current.provider}/${current.model} (${current.reasoningEffort})`
+        let content = deps.copy.modelShowHeader(selection, directory.models.groups.length)
+        if (current.reasoningEffort !== undefined) content += deps.copy.modelShowReasoning(current.reasoningEffort)
+        if (!directory.models.routable) content += deps.copy.modelShowNotRoutable
+        if (directory.models.groups.length === 0) content += deps.copy.modelShowNoGroups
+        if (directory.models.failures.length > 0) {
+          content += deps.copy.modelShowFailures(directory.models.failures.map(failure => failure.name).join(', '))
+        }
+        await followUp(content)
+        return
+      }
+      if (event.commandName === 'permission') {
+        // /permission show|set (16.59–16.61): the bound Session's preset —
+        // the Host bundle of sandbox mode + approval policy. The switch
+        // rides the Host's own /permission command path.
+        const options = event.data['options'] as Array<{ name: string; options?: Array<{ name: string; value?: string }> }> | undefined
+        const subcommand = Array.isArray(options) ? options[0] : undefined
+        const subName = subcommand?.name
+        const sessionId = deps.sessionForThread(event.guildId, event.channelId)
+        if (sessionId === undefined) {
+          await followUp(deps.copy.permissionNeedsThread)
+          return
+        }
+        if (subName === 'show') {
+          const view = await showPermission(deps.permission, { sessionId })
+          if (view.outcome === 'failed') {
+            await followUp(deps.copy.permissionShowUnavailable)
+            return
+          }
+          const current = view.current === undefined
+            ? deps.copy.permissionShowUnknownCurrent
+            : permissionPresetLabel(view.current, deps.copy)
+          const entries = view.entries.map(preset => permissionPresetLabel(preset, deps.copy)).join(' · ')
+          await followUp(deps.copy.permissionShowHeader(current, entries))
+          return
+        }
+        if (subName === 'set') {
+          // Host-operator authority by default — danger-full-access strips
+          // sandbox AND approval at once (16.60); deployments may loosen.
+          const requireOperator = deps.permissionSelectOperatorOnly()
+          const decision = authorize(event)
+          if (!decision.allowed || (requireOperator && decision.level !== 'host-operator')) {
+            await followUp(deps.copy.permissionSelectOperatorOnly)
+            return
+          }
+          const wireOptions = Array.isArray(subcommand?.options) ? subcommand.options : []
+          const typedPreset = wireOptions.find(option => option.name === 'preset')?.value
+          if (typeof typedPreset !== 'string' || typedPreset === '') {
+            await followUp(deps.copy.permissionNotInCatalog)
+            return
+          }
+          if (requiresConfirmation(typedPreset)) {
+            // The dangerous preset(s) go through an explicit risk
+            // confirmation — the web UI shows the same gate (16.61).
+            const nowMs = Date.now()
+            const expiresAtMs = nowMs + 15 * 60 * 1000
+            const base = { kind: 'permission-confirm', sessionId, preset: typedPreset, guildId: event.guildId, actorId: event.actorId, expiresAtMs }
+            const confirmId = deps.registry.register({ ...base, action: 'confirm' })
+            const cancelId = deps.registry.register({ ...base, action: 'cancel' })
+            const label = permissionPresetLabel(typedPreset, deps.copy)
+            const content = `${deps.copy.permissionConfirmHeader(label)}\n${deps.copy.permissionConfirmBody}`
+            const promptMessageId = await followUp(content, [{
+              type: 1,
+              components: [
+                { type: 2, style: 3, label: deps.copy.permissionConfirmButton, custom_id: confirmId },
+                { type: 2, style: 4, label: deps.copy.permissionConfirmCancelButton, custom_id: cancelId },
+              ],
+            }])
+            // Remember the posted prompt so a settle can gray the buttons
+            // out — an unsettled-looking live control invites second clicks.
+            sweepPermissionPrompts(nowMs)
+            if (promptMessageId !== undefined) {
+              const record: PermissionPromptRecord = {
+                messageId: promptMessageId,
+                interactionToken,
+                content,
+                confirmCustomId: confirmId,
+                cancelCustomId: cancelId,
+                confirmLabel: deps.copy.permissionConfirmButton,
+                cancelLabel: deps.copy.permissionConfirmCancelButton,
+                createdAtMs: nowMs,
+              }
+              permissionPrompts.set(confirmId, record)
+              permissionPrompts.set(cancelId, record)
+            }
+            return
+          }
+          const result = await applyPermissionPreset(deps.permission, {
+            decision,
+            sessionId,
+            preset: typedPreset,
+            requireHostOperator: requireOperator,
+          })
+          await followUp(renderPermissionApply(deps.copy, result))
+          return
+        }
+        await followUp(deps.copy.unknownSubcommand)
+        return
+      }
+      if (event.commandName === 'session') {
+        // /session resume: cold-adopt an existing DSH session into a new
+        // thread of the bound project channel (16.44). /session new is
+        // deliberately absent — the @mention is the new-session path.
+        const options = event.data['options'] as Array<{ name: string; options?: Array<{ name: string; value?: string }> }> | undefined
+        const subcommand = Array.isArray(options) ? options[0] : undefined
+        if (subcommand?.name === 'pick') {
+          if (deps.openPicker === undefined) {
+            await followUp(deps.copy.pickerFailed)
+            return
+          }
+          const decision = authorize(event)
+          if (!decision.allowed) {
+            await followUp(deps.copy.commandFailed)
+            return
+          }
+          const opened = await deps.openPicker({ guildId: event.guildId, channelId: event.channelId, actorId: event.actorId })
+          await followUp(opened.outcome === 'opened' ? deps.copy.pickerOpened(opened.threadId) : deps.copy.pickerFailed)
+          return
+        }
+        if (subcommand?.name !== 'resume') {
+          await followUp(deps.copy.unknownSubcommand)
+          return
+        }
+        const binding = deps.channelBinding(event.guildId, event.channelId)
+        if (binding === undefined) {
+          await followUp(deps.copy.sessionResumeNeedsBoundChannel)
+          return
+        }
+        const wireOptions = Array.isArray(subcommand.options) ? subcommand.options : []
+        const sessionId = wireOptions.find(option => option.name === 'session')?.value
+        if (typeof sessionId !== 'string' || sessionId === '') {
+          await followUp(deps.copy.sessionResumeFailed)
+          return
+        }
+        const outcome = await deps.resumeSession({
+          sessionId,
+          workspaceId: binding.workspaceId,
+          guildId: event.guildId,
+          parentChannelId: event.channelId,
+          actorId: event.actorId,
+        })
+        if (outcome.outcome === 'refused-control-channel') {
+          await followUp(deps.copy.sessionResumeControlChannel)
+          return
+        }
+        if (outcome.outcome === 'refused-subagent') {
+          await followUp(deps.copy.sessionResumeSubagent)
+          return
+        }
+        if (outcome.outcome === 'refused-archived') {
+          await followUp(deps.copy.sessionResumeArchived)
+          return
+        }
+        if (outcome.outcome === 'already-bound') {
+          await followUp(deps.copy.sessionResumeAlreadyBound(outcome.threadId))
+          return
+        }
+        if (outcome.outcome === 'started') {
+          await followUp(deps.copy.sessionResumeStarted(outcome.threadId))
+          return
+        }
+        await followUp(deps.copy.sessionResumeFailed)
+        return
+      }
+      // Terminal guard: a recognized interaction type with an unhandled
+      // command name must still answer, never strand on the deferred ack.
+      await followUp(deps.copy.unknownSubcommand)
+    } catch (cause) {
+      deps.warn('discord_slash_handler_failed', String(cause))
+      await followUp(deps.copy.commandFailed).catch(() => {})
+    }
+  }
+
+  async function routeBindComponent(event: RouterEvent, interactionToken: string): Promise<void> {
+    const customId = event.data['custom_id']
+    if (typeof customId !== 'string') return
+    const resolved = deps.registry.resolve(customId, Date.now())
+    const bindContext = resolved.found ? resolved.context : undefined
+    if (bindContext?.['kind'] !== 'project-bind') return
+    const rest = await deps.rest()
+    if (rest === undefined) { deps.log('discord_ack_failed', 'missing-token'); return }
+    // Deferred update ack (type 6): keeps the ephemeral visible while the
+    // commit resolves; the result arrives as a fresh ephemeral followup.
+    const clicked = await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, { type: 6 })
+    if (clicked.outcome !== 'completed') { deps.log('discord_ack_failed', clicked.outcome); return }
+    const followUpResult = async (content: string): Promise<void> => {
+      const posted = await rest.request('POST', `/webhooks/${deps.applicationId()}/${interactionToken}`, { content, flags: OUTBOUND_EPHEMERAL_FLAGS })
+      if (posted.outcome !== 'completed') {
+        deps.log('discord_followup_failed', posted.outcome === 'rejected' ? `HTTP ${String(posted.status)}` : posted.reason)
+      }
+    }
+    const owner = bindContext['actorId']
+    const workspaceId = bindContext['workspaceId']
+    const workspaceTitle = bindContext['workspaceTitle']
+    const boundGuildId = bindContext['guildId']
+    if (
+      owner !== event.actorId
+      || typeof workspaceId !== 'string'
+      || typeof workspaceTitle !== 'string'
+      || typeof boundGuildId !== 'string'
+    ) {
+      // Another member's button (or a malformed context): deny
+      // ephemerally and leave the control pending for its rightful owner.
+      await followUpResult(deps.copy.confirmNotOwner)
+      return
+    }
+    if (bindContext['action'] !== 'confirm') {
+      await followUpResult(deps.copy.bindCancelled)
+      return
+    }
+    // The write happens only now, on explicit confirmation: provision
+    // (or reuse) the Workspace's home channel and bind it — the channel
+    // the command was typed in is never captured.
+    const ensuredChannel = await deps.ensureWorkspaceChannel({
+      guildId: boundGuildId,
+      workspaceId,
+      title: workspaceTitle,
+      actorId: event.actorId,
+    }).catch((cause: unknown) => {
+      deps.log('discord_workspace_channel_ensure_threw', String(cause))
+      return undefined
+    })
+    if (ensuredChannel === undefined) {
+      await followUpResult(deps.copy.bindChannelFailed)
+      return
+    }
+    deps.log('discord_project_bind_commit', { workspaceId, channelId: ensuredChannel.channelId, created: ensuredChannel.created })
+    await followUpResult(ensuredChannel.created
+      ? deps.copy.bindChannelCreated(workspaceTitle, ensuredChannel.channelId)
+      : deps.copy.bindChannelExisting(workspaceTitle, ensuredChannel.channelId))
+  }
+
+  async function routeGuildForGetComponent(event: RouterEvent, interactionToken: string): Promise<void> {
+    const customId = event.data['custom_id']
+    if (typeof customId !== 'string') return
+    const resolved = deps.registry.resolve(customId, Date.now())
+    const context = resolved.found ? resolved.context : undefined
+    if (context?.['kind'] !== 'guild-forget') return
+    const rest = await deps.rest()
+    if (rest === undefined) { deps.log('discord_ack_failed', 'missing-token'); return }
+    const clicked = await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, { type: 6 })
+    if (clicked.outcome !== 'completed') { deps.log('discord_ack_failed', clicked.outcome); return }
+    const owner = context['actorId']
+    const guildId = context['guildId']
+    if (owner !== event.actorId || typeof guildId !== 'string' || guildId !== event.guildId) {
+      const denied = await rest.request('POST', `/webhooks/${deps.applicationId()}/${interactionToken}`, { content: deps.copy.confirmNotOwner, flags: OUTBOUND_EPHEMERAL_FLAGS })
+      if (denied.outcome !== 'completed') deps.log('discord_followup_failed', denied.outcome)
+      return
+    }
+    // Click-time re-authorization (review D2, aligned with permission-
+    // confirm): the 15-minute control window outlives an operator
+    // revocation, and forget mutates adapter-owned state for the whole
+    // guild — owner identity alone is not authority enough at click time.
+    if (!deps.policy().hostOperatorUserIds.includes(event.actorId)) {
+      const refused = await rest.request('POST', `/webhooks/${deps.applicationId()}/${interactionToken}`, { content: deps.copy.forgetOperatorOnly, flags: OUTBOUND_EPHEMERAL_FLAGS })
+      if (refused.outcome !== 'completed') deps.log('discord_followup_failed', refused.outcome)
+      return
+    }
+    await deps.forgetGuild(guildId)
+    deps.log('discord_guild_forget_commit', { guildId })
+    const posted = await rest.request('POST', `/webhooks/${deps.applicationId()}/${interactionToken}`, {
+      content: deps.copy.forgetDone,
+      flags: OUTBOUND_EPHEMERAL_FLAGS,
+    })
+    if (posted.outcome !== 'completed') deps.log('discord_followup_failed', posted.outcome)
+  }
+
+  /**
+   * The danger-full-access risk confirmation (16.61): ack, then re-authorize
+   * the clicker (deny-first — the initiating command's grant proves nothing
+   * at click time), settle as confirm-then-switch or cancel.
+   */
+  async function routePermissionConfirmComponent(event: RouterEvent, interactionToken: string): Promise<void> {
+    const customId = event.data['custom_id']
+    if (typeof customId !== 'string') return
+    const resolved = deps.registry.resolve(customId, Date.now())
+    const context = resolved.found ? resolved.context : undefined
+    if (context?.['kind'] !== 'permission-confirm') return
+    const rest = await deps.rest()
+    if (rest === undefined) { deps.log('discord_ack_failed', 'missing-token'); return }
+    const clicked = await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, { type: 6 })
+    if (clicked.outcome !== 'completed') { deps.log('discord_ack_failed', clicked.outcome); return }
+    const owner = context['actorId']
+    const sessionId = context['sessionId']
+    const preset = context['preset']
+    if (owner !== event.actorId || typeof sessionId !== 'string' || typeof preset !== 'string') {
+      const denied = await rest.request('POST', `/webhooks/${deps.applicationId()}/${interactionToken}`, { content: deps.copy.confirmNotOwner, flags: OUTBOUND_EPHEMERAL_FLAGS })
+      if (denied.outcome !== 'completed') deps.log('discord_followup_failed', denied.outcome)
+      return
+    }
+    const respond = async (content: string): Promise<void> => {
+      const posted = await rest.request('POST', `/webhooks/${deps.applicationId()}/${interactionToken}`, { content, flags: OUTBOUND_EPHEMERAL_FLAGS })
+      if (posted.outcome !== 'completed') deps.log('discord_followup_failed', posted.outcome)
+    }
+    /**
+     * Retire the posted prompt: both buttons gray out so the settled
+     * control never looks live again. The prompt was posted by the SLASH
+     * interaction's webhook, so only that token can edit it; a late click
+     * past the webhook token's lifetime fails the edit loudly but the
+     * outcome followup still reaches the clicker (the registry TTL already
+     * bounds double-clicks well inside the window).
+     */
+    const retirePrompt = async (): Promise<void> => {
+      const record = permissionPrompts.get(customId)
+      permissionPrompts.delete(record?.confirmCustomId ?? customId)
+      permissionPrompts.delete(record?.cancelCustomId ?? customId)
+      if (record === undefined) return
+      const patched = await rest.request('PATCH', `/webhooks/${deps.applicationId()}/${record.interactionToken}/messages/${record.messageId}`, {
+        content: record.content,
+        flags: OUTBOUND_EPHEMERAL_FLAGS,
+        components: [{
+          type: 1,
+          components: [
+            { type: 2, style: 3, label: record.confirmLabel, custom_id: record.confirmCustomId, disabled: true },
+            { type: 2, style: 4, label: record.cancelLabel, custom_id: record.cancelCustomId, disabled: true },
+          ],
+        }],
+      })
+      if (patched.outcome !== 'completed') {
+        deps.warn('discord_permission_prompt_retire_failed', patched.outcome === 'rejected' ? `HTTP ${String(patched.status)}` : patched.reason)
+      }
+    }
+    if (context['action'] !== 'confirm') {
+      await retirePrompt()
+      await respond(deps.copy.permissionCancelled)
+      return
+    }
+    // Re-run the full authorization + catalog validation at click time; the
+    // settings flag may have flipped since the prompt was posted.
+    const decision = authorize(event)
+    await retirePrompt()
+    const result = await applyPermissionPreset(deps.permission, {
+      decision,
+      sessionId,
+      preset,
+      requireHostOperator: deps.permissionSelectOperatorOnly(),
+    })
+    deps.log('discord_permission_confirm', { outcome: result.outcome, preset })
+    await respond(result.outcome === 'applied'
+      ? `${deps.copy.permissionConfirmed(permissionPresetLabel(preset, deps.copy))}\n${renderPermissionApply(deps.copy, result)}`
+      : renderPermissionApply(deps.copy, result))
+  }
+
+  /** One cascade stage: ack, re-authorize, then advance or apply (16.35). */
+  async function routeModelComponent(event: RouterEvent, interactionToken: string): Promise<void> {
+    const customId = event.data['custom_id']
+    if (typeof customId !== 'string') return
+    const resolved = deps.registry.resolve(customId, Date.now())
+    const context = resolved.found ? resolved.context : undefined
+    const rest = await deps.rest()
+    if (rest === undefined) return
+    // Ack BEFORE the catalog reads and the DSH round trip: component
+    // interactions must receive an initial response within 3s.
+    const acked = await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, { type: 6 })
+    if (acked.outcome !== 'completed') deps.log('discord_ack_failed', acked.outcome)
+    const followUp = async (content: string, components?: Array<unknown>): Promise<void> => {
+      const posted = await rest.request('POST', `/webhooks/${deps.applicationId()}/${interactionToken}`, {
+        content,
+        flags: OUTBOUND_EPHEMERAL_FLAGS,
+        ...(components === undefined ? {} : { components }),
+      })
+      if (posted.outcome !== 'completed') {
+        deps.log('discord_followup_failed', posted.outcome === 'rejected' ? `HTTP ${String(posted.status)}` : posted.reason)
+      }
+    }
+    if (context === undefined) {
+      await followUp(deps.copy.modelCascadeExpired)
+      return
+    }
+    // Every stage re-checks Host-operator authority: a forwarded menu must
+    // not let another member drive — or enumerate — the selection surface.
+    const requireOperator = deps.modelSelectOperatorOnly()
+    const decision = authorize(event)
+    if (!decision.allowed || (requireOperator && decision.level !== 'host-operator')) {
+      await followUp(deps.copy.modelSelectOperatorOnly)
+      return
+    }
+    const sessionId = typeof context['sessionId'] === 'string' ? context['sessionId'] : undefined
+    const stage = context['stage']
+    if (sessionId === undefined || typeof stage !== 'string') {
+      await followUp(deps.copy.modelCascadeExpired)
+      return
+    }
+    const value = event.selectValues[0]
+    if (typeof value !== 'string' || value === '') {
+      await followUp(deps.copy.modelCascadeExpired)
+      return
+    }
+    try {
+      if (stage === 'provider') {
+        const directory = await deps.model.models(sessionId)
+        const group = directory.outcome === 'completed'
+          ? directory.models.groups.find(candidate => candidate.id === value)
+          : undefined
+        if (group === undefined || group.models.length === 0) {
+          await followUp(deps.copy.modelSelectNoModels)
+          return
+        }
+        const truncated = group.models.length > 25 ? deps.copy.modelCascadeTruncated(25, group.models.length) : ''
+        const menuId = deps.registry.register({ kind: 'model', stage: 'model', sessionId, provider: group.id, expiresAtMs: Date.now() + 15 * 60 * 1000 })
+        await followUp(deps.copy.modelCascadeModelHeader(group.name) + truncated, selectMenuRow(menuId, deps.copy.modelCascadeModelPlaceholder, group.models.slice(0, 25).map(model => ({
+            label: model.name !== '' ? model.name : model.id,
+            value: model.id,
+            ...(model.description === undefined ? {} : { description: model.description.slice(0, 100) }),
+          }))))
+        return
+      }
+      if (stage === 'model') {
+        const provider = typeof context['provider'] === 'string' ? context['provider'] : undefined
+        if (provider === undefined) {
+          await followUp(deps.copy.modelCascadeExpired)
+          return
+        }
+        const directory = await deps.model.models(sessionId)
+        const group = directory.outcome === 'completed'
+          ? directory.models.groups.find(candidate => candidate.id === provider)
+          : undefined
+        const model = group?.models.find(candidate => candidate.id === value)
+        const efforts = model?.reasoning?.efforts ?? []
+        if (efforts.length === 0) {
+          // No reasoning metadata: apply with the provider/default behavior.
+          const result = await applyModelSelection(deps.model, { decision, sessionId, provider, model: value, requireHostOperator: requireOperator })
+          await followUp(renderModelApply(deps.copy, result))
+          return
+        }
+        const menuId = deps.registry.register({ kind: 'model', stage: 'reasoning', sessionId, provider, model: value, expiresAtMs: Date.now() + 15 * 60 * 1000 })
+        const defaultEffort = model?.reasoning?.defaultEffort
+        const options = [
+          {
+            label: deps.copy.modelCascadeReasoningDefault,
+            value: '__default__',
+            description: (defaultEffort === undefined
+              ? deps.copy.modelCascadeReasoningDefaultHint
+              : `${deps.copy.modelCascadeReasoningDefaultHint} (${defaultEffort})`).slice(0, 100),
+          },
+          ...efforts.slice(0, 24).map(effort => ({
+            label: effort.name,
+            value: effort.id,
+            ...(effort.description === undefined ? {} : { description: effort.description.slice(0, 100) }),
+          })),
+        ]
+        const modelLabel = model?.name !== undefined && model.name !== '' ? model.name : value
+        await followUp(deps.copy.modelCascadeReasoningHeader(modelLabel), selectMenuRow(menuId, deps.copy.modelCascadeReasoningPlaceholder, options))
+        return
+      }
+      if (stage === 'reasoning') {
+        const provider = typeof context['provider'] === 'string' ? context['provider'] : undefined
+        const model = typeof context['model'] === 'string' ? context['model'] : undefined
+        if (provider === undefined || model === undefined) {
+          await followUp(deps.copy.modelCascadeExpired)
+          return
+        }
+        const result = await applyModelSelection(deps.model, {
+          decision,
+          sessionId,
+          provider,
+          model,
+          requireHostOperator: requireOperator,
+          ...(value === '__default__' ? {} : { reasoningEffort: value }),
+        })
+        await followUp(renderModelApply(deps.copy, result))
+        return
+      }
+      await followUp(deps.copy.modelCascadeExpired)
+    } catch (cause) {
+      deps.warn('discord_model_cascade_failed', String(cause))
+      await deps.componentFollowUp(event.interactionId, interactionToken, deps.copy.commandFailed).catch(() => {})
+    }
+  }
+
+  async function settleQuestionInteraction(
+    event: RouterEvent,
+    interactionToken: string,
+    outcome: QuestionInteractionOutcome,
+  ): Promise<void> {
+    if (outcome.outcome === 'modal-requested') {
+      const rest = await deps.rest()
+      if (rest === undefined) return
+      const modal = outcome.modal
+      const posted = await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, {
+        type: 9,
+        data: {
+          custom_id: modal.custom_id,
+          // `title` is REQUIRED by the MODAL callback (1–45 chars). Omitting it
+          // fails form validation, Discord drops the interaction, and the
+          // select the user just clicked stays dead with no error shown.
+          title: modal.title,
+          components: [{
+            type: 1,
+            components: [{
+              type: 4,
+              custom_id: 'answer',
+              style: 2,
+              label: modal.textInput.label,
+              min_length: modal.textInput.min_length,
+              max_length: modal.textInput.max_length,
+              required: true,
+            }],
+          }],
+        },
+      })
+      // A rejected type-9 leaves the client with a silently dead select —
+      // Discord drops the interaction with no user-visible error, so the
+      // refusal must be on the record (title/label bounds are the usual
+      // cause).
+      if (posted.outcome !== 'completed') {
+        deps.warn('discord_question_modal_failed', posted.outcome === 'rejected'
+          ? `HTTP ${String(posted.status)} ${JSON.stringify(posted.error)}`
+          : `rest ${posted.reason}`)
+      }
+      return
+    }
+    // Every other outcome settles as a deferred update plus an ephemeral
+    // followup; the rendered controls retire on the submitted terminal
+    // outcome (question-routing) or via expiry/remote resolution — stray
+    // clicks meanwhile still answer honestly through the stores.
+    const rest = await deps.rest()
+    if (rest === undefined) return
+    await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, { type: 6 })
+    const notice: string | undefined =
+      outcome.outcome === 'submitted' ? deps.copy.questionSubmitted
+      : outcome.outcome === 'denied' ? deps.copy.questionDenied
+      : outcome.outcome === 'already-resolved' ? deps.copy.questionAlreadyResolved
+      : outcome.outcome === 'incomplete' ? deps.copy.questionIncomplete
+      : outcome.outcome === 'invalid-answer' ? deps.copy.questionInvalid(outcome.reason)
+      : outcome.outcome === 'unresolved' ? deps.copy.questionUnresolved
+      : outcome.outcome === 'resolved-elsewhere' ? deps.copy.questionResolvedElsewhere
+      : undefined
+    if (notice !== undefined) await deps.componentFollowUp(event.interactionId, interactionToken, notice)
+  }
+
+  /**
+   * Fork addition: the two-step conversation picker.
+   *
+   * Step `workspace`: resolve the clicked Workspace from the registry
+   * candidates, list its recent conversations, and edit the SAME picker
+   * message into the session select. Step `session`: bind the thread to the
+   * chosen conversation (or create a new one) and replace the controls with
+   * the outcome line. The click is ack'd (type 6) before any Host call, so
+   * the 3-second Discord budget is never violated.
+   */
+  async function routeSessionPickerComponent(event: RouterEvent, interactionToken: string): Promise<void> {
+    const customId = event.data['custom_id']
+    if (typeof customId !== 'string') return
+    const rest = await deps.rest()
+    if (rest === undefined) return
+    /**
+     * Component messages are edited through the interaction itself: a type-7
+     * UPDATE_MESSAGE answer while the 3-second budget allows, otherwise a
+     * type-6 defer plus the webhook `@original` edit (the documented
+     * deferred-update follow-up). A channel-endpoint PATCH works for plain
+     * bot messages but is the wrong surface for a component interaction.
+     */
+    /**
+     * Discord rejects a malformed interaction body with 50035 and leaves the
+     * click dead, so the update never depends on the interaction path alone:
+     * a failed type-7 answer falls back to posting a fresh message in the
+     * same thread (a plain channel POST is the surface already proven to
+     * accept the same components).
+     */
+    const respondUpdate = async (content: string, components: Array<unknown> = []): Promise<void> => {
+      const answered = await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, {
+        type: 7,
+        data: { content, components },
+      })
+      if (answered.outcome === 'completed') return
+      deps.log('discord_picker_update_failed', answered.outcome === 'rejected'
+        ? { status: answered.status, error: answered.error }
+        : answered.outcome)
+      await postNotice(content, components)
+    }
+    const postNotice = async (content: string, components: Array<unknown> = []): Promise<void> => {
+      const posted = await rest.request('POST', `/channels/${event.channelId}/messages`, {
+        content,
+        ...(components.length === 0 ? {} : { components }),
+        flags: DISCORD_SUPPRESS_NOTIFICATIONS_FLAG,
+        allowed_mentions: ALLOWED_MENTIONS_NONE,
+      })
+      if (posted.outcome !== 'completed') {
+        deps.log('discord_picker_notice_failed', posted.outcome === 'rejected' ? { status: posted.status, error: posted.error } : posted.outcome)
+      }
+    }
+    const editMessage = async (content: string, components: Array<unknown> = []): Promise<void> => {
+      const deferred = await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, { type: 6 })
+      if (deferred.outcome !== 'completed') {
+        deps.log('discord_picker_defer_failed', deferred.outcome === 'rejected' ? { status: deferred.status, error: deferred.error } : deferred.outcome)
+        await postNotice(content, components)
+        return
+      }
+      const edited = await rest.request('PATCH', `/webhooks/${deps.applicationId()}/${interactionToken}/messages/@original`, {
+        content,
+        components,
+        allowed_mentions: ALLOWED_MENTIONS_NONE,
+      })
+      if (edited.outcome !== 'completed') {
+        deps.log('discord_picker_edit_failed', edited.outcome === 'rejected' ? { status: edited.status, error: edited.error } : edited.outcome)
+        await postNotice(content, components)
+      }
+    }
+    const resolved = deps.registry.resolve(customId, Date.now())
+    const context = resolved.found ? resolved.context : undefined
+    if (context?.['kind'] !== 'session-picker' || deps.picker === undefined) {
+      await editMessage(deps.copy.pickerFailed)
+      return
+    }
+    const decision = authorize(event)
+    if (!decision.allowed) {
+      await editMessage(deps.copy.pickerFailed)
+      return
+    }
+    const value = event.selectValues[0]
+    if (typeof value !== 'string') return
+    const candidates = Array.isArray(context['candidates']) ? context['candidates'] as Array<Record<string, unknown>> : []
+    const index = resolveChoiceIndex(value, candidates.length)
+    if (index === null) {
+      await editMessage(deps.copy.pickerFailed)
+      return
+    }
+    if (context['step'] === 'workspace') {
+      if (index === undefined) {
+        await editMessage(deps.copy.pickerFailed)
+        return
+      }
+      const workspace = candidates[index] ?? {}
+      const workspaceId = typeof workspace['workspaceId'] === 'string' ? workspace['workspaceId'] : ''
+      const workspaceTitle = typeof workspace['title'] === 'string' && workspace['title'] !== ''
+        ? workspace['title']
+        : workspaceId.slice(0, 8)
+      const path = typeof workspace['path'] === 'string' ? workspace['path'] : undefined
+      if (workspaceId === '') {
+        await editMessage(deps.copy.pickerFailed)
+        return
+      }
+      const listed = await deps.picker.sessionChoices({
+        guildId: event.guildId,
+        workspaceId,
+        ...(path === undefined ? {} : { path }),
+      })
+      if (listed.outcome !== 'ok') {
+        await editMessage(deps.copy.pickerUnavailable)
+        return
+      }
+      const choices = sessionChoices(listed.sessions, { boundSessionIds: deps.picker.boundSessionIds() })
+      const nextId = deps.registry.register({
+        kind: 'session-picker',
+        step: 'session',
+        guildId: event.guildId,
+        threadId: event.channelId,
+        actorId: event.actorId,
+        workspaceId,
+        workspaceTitle,
+        candidates: listed.sessions.map(row => ({ sessionId: row.sessionId, title: row.title ?? '' })),
+        expiresAtMs: Date.now() + 15 * 60 * 1000,
+      })
+      // selectMenuRow already returns the action-row array; wrapping it
+      // again makes Discord reject the form body (50035 MODEL_TYPE_CONVERT).
+      await respondUpdate(deps.copy.pickerSessionHeader(workspaceTitle), selectMenuRow(nextId, deps.copy.pickerSessionPlaceholder, choices))
+      deps.log('discord_picker_workspace_selected', { workspaceId, sessions: listed.sessions.length })
+      return
+    }
+    if (context['step'] === 'session') {
+      const workspaceId = typeof context['workspaceId'] === 'string' ? context['workspaceId'] : ''
+      const threadId = event.channelId
+      if (index === undefined) {
+        const created = await deps.picker.create({ guildId: event.guildId, threadId, actorId: event.actorId, workspaceId })
+        if (created.outcome !== 'followed') {
+          await editMessage(deps.copy.pickerFailed)
+          return
+        }
+        await editMessage(deps.copy.pickerStarted(created.title))
+        deps.log('discord_picker_created', { workspaceId, threadId })
+        return
+      }
+      const row = candidates[index] ?? {}
+      const sessionId = typeof row['sessionId'] === 'string' ? row['sessionId'] : ''
+      if (sessionId === '') {
+        await editMessage(deps.copy.pickerFailed)
+        return
+      }
+      const title = typeof row['title'] === 'string' && row['title'] !== '' ? row['title'] : undefined
+      const attached = await deps.picker.attach({ guildId: event.guildId, threadId, actorId: event.actorId, sessionId, workspaceId, ...(title === undefined ? {} : { title }) })
+      if (attached.outcome === 'already-bound') {
+        await editMessage(deps.copy.pickerAlreadyBound(attached.threadId))
+        return
+      }
+      if (attached.outcome !== 'followed') {
+        await editMessage(deps.copy.pickerFailed)
+        return
+      }
+      await editMessage(deps.copy.pickerFollowed(attached.title))
+      deps.log('discord_picker_attached', { sessionId, threadId })
+      return
+    }
+  }
+
+  /**
+   * Redelivery fence (review C-4): Discord re-delivers component
+   * interactions across gateway resume/reconnect. The ask stores are
+   * claim-idempotent, but the one-shot flows (guild-forget, permission
+   * confirm, model cascade, bind commit) are not — a redelivery
+   * re-executed them (a duplicate /permission run carries its own audit
+   * pair). One execution per interaction id, bounded LRU, process-local.
+   */
+  const seenInteractions = new Set<string>()
+  const SEEN_INTERACTIONS_MAX = 512
+
+  return {
+    async route(event, interactionToken) {
+      if (event.interactionId !== '' && seenInteractions.has(event.interactionId)) return
+      if (event.interactionId !== '') {
+        seenInteractions.add(event.interactionId)
+        if (seenInteractions.size > SEEN_INTERACTIONS_MAX) {
+          const oldest = seenInteractions.values().next().value
+          if (oldest !== undefined) seenInteractions.delete(oldest)
+        }
+      }
+      deps.log('discord_slash_dispatch', {
+        interactionId: event.interactionId,
+        commandName: event.commandName,
+        hasToken: interactionToken !== undefined,
+      })
+      if (event.interactionType === 4 && interactionToken !== undefined) {
+        await routeAutocomplete(event, interactionToken)
+        return
+      }
+      if (event.interactionType === 2 && interactionToken !== undefined) {
+        await routeSlashCommand(event, interactionToken)
+        return
+      }
+      if (event.interactionType === 5 && interactionToken !== undefined) {
+        const modalCustomId = event.data['custom_id']
+        if (typeof modalCustomId !== 'string') return
+        try {
+          const text = event.modalFields.find(field => field.customId === 'answer')?.value ?? ''
+          const outcome = await deps.handleQuestionModal({
+            customId: modalCustomId,
+            userId: event.actorId,
+            threadId: event.channelId,
+            text,
+          })
+          deps.log('discord_question_modal_submit', { outcome: outcome.outcome, userId: event.actorId })
+          await settleQuestionInteraction(event, interactionToken, outcome)
+        } catch (cause) {
+          deps.warn('discord_question_modal_failed', String(cause))
+          const rest = await deps.rest()
+          if (rest !== undefined) {
+            await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, { type: 6 }).catch(() => {})
+            await deps.componentFollowUp(event.interactionId, interactionToken, deps.copy.commandFailed).catch(() => {})
+          }
+        }
+        return
+      }
+      if (event.interactionType !== 3) return
+      const customId = event.data['custom_id']
+      if (typeof customId !== 'string') return
+      if (interactionToken === undefined) return
+      const resolved = deps.registry.resolve(customId, Date.now())
+      const bindContext = resolved.found ? resolved.context : undefined
+      if (bindContext?.['kind'] === 'project-bind') {
+        await routeBindComponent(event, interactionToken)
+        return
+      }
+      if (bindContext?.['kind'] === 'guild-forget') {
+        await routeGuildForGetComponent(event, interactionToken)
+        return
+      }
+      if (bindContext?.['kind'] === 'model') {
+        await routeModelComponent(event, interactionToken)
+        return
+      }
+      if (bindContext?.['kind'] === 'permission-confirm') {
+        await routePermissionConfirmComponent(event, interactionToken)
+        return
+      }
+      if (bindContext?.['kind'] === 'session-picker') {
+        await routeSessionPickerComponent(event, interactionToken)
+        return
+      }
+      // A not-found custom_id means the control was never registered or has
+      // been retired by its TTL (approval/question registry entries stay
+      // resolvable until expiry; claimed-vs-resolved state lives in the
+      // stores). Kimaki discipline: an expired click still gets the
+      // deferred ack plus an explicit ephemeral rerun hint — never silence.
+      if (bindContext === undefined) {
+        const rest = await deps.rest()
+        if (rest !== undefined) {
+          await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, { type: 6 }).then(acked => {
+            if (acked.outcome !== 'completed') deps.log('discord_ack_failed', acked.outcome)
+          }).catch(() => {})
+          await deps.componentFollowUp(event.interactionId, interactionToken, deps.copy.expiredControl).catch(() => {})
+        }
+        return
+      }
+      const isQuestionControl: boolean = 'questionRpcId' in bindContext
+      const isApprovalControl: boolean = 'approvalId' in bindContext
+      if (isQuestionControl) {
+        // A throw here must still ack the click, or Discord renders the
+        // interaction-failed state on the control message.
+        try {
+          const outcome = await deps.handleQuestionComponent({
+            customId,
+            userId: event.actorId,
+            threadId: event.channelId,
+            values: event.selectValues,
+          })
+          deps.log('discord_question_click', { outcome: outcome.outcome, userId: event.actorId, complete: outcome.outcome === 'recorded' ? outcome.complete : undefined })
+          await settleQuestionInteraction(event, interactionToken, outcome)
+        } catch (cause) {
+          deps.warn('discord_question_click_failed', String(cause))
+          const rest = await deps.rest()
+          if (rest !== undefined) {
+            await rest.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, { type: 6 }).then(acked => {
+              if (acked.outcome !== 'completed') deps.log('discord_ack_failed', acked.outcome)
+            }).catch(() => {})
+            await deps.componentFollowUp(event.interactionId, interactionToken, deps.copy.commandFailed).catch(() => {})
+          }
+        }
+        return
+      }
+      if (isApprovalControl) {
+        // Ack the click BEFORE the DSH round-trip: component interactions
+        // must receive an initial response within 3s or every followup 404s.
+        const rest0 = await deps.rest()
+        if (rest0 !== undefined) {
+          const acked = await rest0.request('POST', `/interactions/${event.interactionId}/${interactionToken}/callback`, { type: 6 })
+          if (acked.outcome !== 'completed') deps.log('discord_ack_failed', acked.outcome)
+        }
+        let outcome: ApprovalClickOutcome
+        try {
+          outcome = await handleApprovalClick(
+            {
+              registry: deps.registry,
+              store: deps.approvals,
+              port: deps.approvalRespondPort,
+              nowMs: () => Date.now(),
+            },
+            { customId, userId: event.actorId, threadId: event.channelId },
+          )
+        } catch (cause) {
+          deps.warn('discord_approval_click_failed', String(cause))
+          // The type-6 ack already went out: without a followup the user
+          // gets no failure state at all — answer like the sibling paths.
+          await deps.componentFollowUp(event.interactionId, interactionToken, deps.copy.commandFailed).catch(() => {})
+          return
+        }
+        const approvalId = typeof bindContext['approvalId'] === 'string' ? bindContext['approvalId'] : ''
+        deps.log('discord_approval_click', { outcome: outcome.outcome, userId: event.actorId, approvalId })
+        // `unresolved` intentionally keeps the controls live: the store's
+        // claim accepts a re-click, so the user's own retry stays reachable
+        // until the expiry sweep retires the ask.
+        if (outcome.outcome === 'submitted' || outcome.outcome === 'already-resolved') {
+          await deps.disableControl(approvalId)
+        }
+        if (outcome.outcome === 'denied') {
+          await deps.componentFollowUp(event.interactionId, interactionToken, deps.copy.confirmNotOwner)
+        } else if (outcome.outcome === 'unresolved') {
+          await deps.componentFollowUp(event.interactionId, interactionToken, deps.copy.unresolvedAck)
+        } else if (outcome.outcome === 'submitted') {
+          await deps.componentFollowUp(event.interactionId, interactionToken, deps.copy.submittedAck)
+        }
+        return
+      }
+    },
+  }
+}

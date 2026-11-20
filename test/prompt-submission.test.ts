@@ -1,0 +1,197 @@
+/**
+ * Initial prompt submission tests (8.4). Every submission carries a stable
+ * request id claimed BEFORE the DSH call: same-id/same-hash replays never
+ * resubmit, different hashes conflict, a rejection is final for that intent
+ * (explicit retry mints a NEW intent), and an unknown admission is recorded
+ * and never retried automatically — reconciliation or an explicit user retry
+ * decides.
+ */
+
+import { describe, expect, it, vi } from 'vitest'
+
+import { createKvTableStub } from './helpers/kv-table.js'
+import { createIntentStore, hashPayload } from '../src/state/intents.js'
+import { createPromptSubmissionFlow, type DshPromptPort } from '../src/features/prompt-submission.js'
+
+function setup(submit: DshPromptPort['submit']) {
+  const intents = createIntentStore(createKvTableStub())
+  const submitMock = vi.fn(submit)
+  const port: DshPromptPort = { submit: submitMock }
+  const flow = createPromptSubmissionFlow({ prompts: port, intents, nowMs: () => 1_000 })
+  return { flow, submitFn: submitMock, intents }
+}
+
+const REQUEST = { requestId: 'req-1', sessionId: 'sess-1', prompt: 'do the thing' }
+
+describe('prompt submission', () => {
+  it('submits once and records success', async () => {
+    const { flow, submitFn } = setup(() => Promise.resolve({ outcome: 'accepted' }))
+    const result = await flow.submitOnce(REQUEST)
+    expect(result).toEqual({ outcome: 'accepted' })
+    expect(submitFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('never resubmits a same-id/same-hash replay', async () => {
+    const { flow, submitFn } = setup(() => Promise.resolve({ outcome: 'accepted' }))
+    await flow.submitOnce(REQUEST)
+    const replay = await flow.submitOnce({ ...REQUEST, prompt: 'do the thing' })
+    expect(replay).toEqual({ outcome: 'already-submitted' })
+    expect(submitFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('conflicts when the same request id carries different content', async () => {
+    const { flow, submitFn } = setup(() => Promise.resolve({ outcome: 'accepted' }))
+    await flow.submitOnce(REQUEST)
+    const conflict = await flow.submitOnce({ ...REQUEST, prompt: 'DIFFERENT' })
+    expect(conflict).toEqual({ outcome: 'conflict' })
+    expect(submitFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('records a rejection as final for that intent; explicit retry mints a new one', async () => {
+    const responses: Array<ReturnType<DshPromptPort['submit']>> = [
+      Promise.resolve({ outcome: 'rejected', reason: 'session-not-found' }),
+      Promise.resolve({ outcome: 'accepted' }),
+    ]
+    const { flow, submitFn } = setup(() => responses.shift() ?? Promise.resolve({ outcome: 'accepted' }))
+    const rejected = await flow.submitOnce(REQUEST)
+    expect(rejected).toEqual({ outcome: 'rejected' })
+    expect(submitFn).toHaveBeenCalledTimes(1)
+
+    // The SAME intent is never resubmitted — and the record proves the
+    // prompt was NOT admitted, so the replay says rejected, not
+    // already-submitted.
+    expect(await flow.submitOnce(REQUEST)).toEqual({ outcome: 'rejected' })
+    expect(submitFn).toHaveBeenCalledTimes(1)
+
+    // …but an explicit retry creates a fresh intent and lands.
+    const retry = await flow.retry(REQUEST, { newRequestId: 'req-2' })
+    expect(retry).toEqual({ outcome: 'accepted' })
+    expect(submitFn).toHaveBeenCalledTimes(2)
+  })
+
+  it('records an unknown admission without retrying; explicit retry lands', async () => {
+    const { flow, submitFn } = setup(() => Promise.resolve({ outcome: 'unknown' }))
+    const unknown = await flow.submitOnce(REQUEST)
+    expect(unknown).toEqual({ outcome: 'unknown' })
+    expect(submitFn).toHaveBeenCalledTimes(1)
+
+    // No automatic resubmission of the uncertain intent — and the replay
+    // is honest about it: unknown is not proof of admission.
+    expect(await flow.submitOnce(REQUEST)).toEqual({ outcome: 'unconfirmed' })
+    expect(submitFn).toHaveBeenCalledTimes(1)
+
+    const retry = await flow.retry(REQUEST, { newRequestId: 'req-2' })
+    expect(retry).toEqual({ outcome: 'unknown' })
+    expect(submitFn).toHaveBeenCalledTimes(2)
+  })
+
+  it('reports a replay against a crash-parked claimed intent as unconfirmed', async () => {
+    const { flow, submitFn, intents } = setup(() => Promise.resolve({ outcome: 'accepted' }))
+    // Crash window: the first delivery claimed the intent but never
+    // settled it (the adapter died between claim and settle). The record
+    // stays claimed forever; a gateway redelivery must not report
+    // already-submitted — nothing proves DSH ever saw the prompt.
+    const contentHash = await hashPayload({ sessionId: REQUEST.sessionId, prompt: REQUEST.prompt })
+    await intents.claim({ messageId: REQUEST.requestId, contentHash, claimedAtMs: 1_000 })
+
+    expect(await flow.submitOnce(REQUEST)).toEqual({ outcome: 'unconfirmed' })
+    expect(submitFn).not.toHaveBeenCalled()
+  })
+})
+
+describe('prompt submission with images (16.50)', () => {
+  const PNG = { mediaType: 'image/png', base64: 'cG5n' }
+  const GIF = { mediaType: 'image/gif', base64: 'Z2lm' }
+
+  it('carries images through to the port on the submitted request', async () => {
+    const { flow, submitFn } = setup(() => Promise.resolve({ outcome: 'accepted' }))
+    const result = await flow.submitOnce({ ...REQUEST, images: [PNG] })
+    expect(result).toEqual({ outcome: 'accepted' })
+    expect(submitFn.mock.calls[0]?.[0]).toEqual({
+      requestId: 'req-1',
+      sessionId: 'sess-1',
+      prompt: 'do the thing',
+      mode: 'queue',
+      images: [PNG],
+    })
+  })
+
+  it('keeps text-only requests at the exact legacy wire shape (no images key)', async () => {
+    const { flow, submitFn } = setup(() => Promise.resolve({ outcome: 'accepted' }))
+    await flow.submitOnce(REQUEST)
+    expect(Object.keys(submitFn.mock.calls[0]?.[0] ?? {})).toEqual(['requestId', 'sessionId', 'prompt', 'mode'])
+  })
+
+  it('dedupes a replay of the same id with the same images', async () => {
+    const { flow, submitFn } = setup(() => Promise.resolve({ outcome: 'accepted' }))
+    await flow.submitOnce({ ...REQUEST, images: [PNG] })
+    const replay = await flow.submitOnce({ ...REQUEST, images: [PNG] })
+    expect(replay).toEqual({ outcome: 'already-submitted' })
+    expect(submitFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('conflicts when the same request id carries a different image', async () => {
+    const { flow, submitFn } = setup(() => Promise.resolve({ outcome: 'accepted' }))
+    await flow.submitOnce({ ...REQUEST, images: [PNG] })
+    const conflict = await flow.submitOnce({ ...REQUEST, images: [GIF] })
+    expect(conflict).toEqual({ outcome: 'conflict' })
+    expect(submitFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('hashes images separately from text: same image + different text conflicts', async () => {
+    const { flow, submitFn } = setup(() => Promise.resolve({ outcome: 'accepted' }))
+    await flow.submitOnce({ ...REQUEST, images: [PNG] })
+    const conflict = await flow.submitOnce({ ...REQUEST, prompt: 'DIFFERENT', images: [PNG] })
+    expect(conflict).toEqual({ outcome: 'conflict' })
+    expect(submitFn).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('prompt submission with attached file text parts (16.114)', () => {
+  const A = '<<<DSH_ATTACHED_FILE_BEGIN>>>\nnotes.txt\nFILE-A\n<<<DSH_ATTACHED_FILE_END>>>'
+  const B = '<<<DSH_ATTACHED_FILE_BEGIN>>>\nnotes.txt\nFILE-B\n<<<DSH_ATTACHED_FILE_END>>>'
+
+  it('carries textParts to the port and does not invent an images key', async () => {
+    const { flow, submitFn } = setup(() => Promise.resolve({ outcome: 'accepted' }))
+    const result = await flow.submitOnce({ ...REQUEST, textParts: [A] })
+    expect(result).toEqual({ outcome: 'accepted' })
+    expect(submitFn.mock.calls[0]?.[0]).toEqual({
+      requestId: 'req-1',
+      sessionId: 'sess-1',
+      prompt: 'do the thing',
+      mode: 'queue',
+      textParts: [A],
+    })
+  })
+
+  it('dedupes a replay of the same id with the same file text', async () => {
+    const { flow, submitFn } = setup(() => Promise.resolve({ outcome: 'accepted' }))
+    await flow.submitOnce({ ...REQUEST, textParts: [A] })
+    expect(await flow.submitOnce({ ...REQUEST, textParts: [A] })).toEqual({ outcome: 'already-submitted' })
+    expect(submitFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('conflicts when the same id carries different file text', async () => {
+    const { flow, submitFn } = setup(() => Promise.resolve({ outcome: 'accepted' }))
+    await flow.submitOnce({ ...REQUEST, textParts: [A] })
+    expect(await flow.submitOnce({ ...REQUEST, textParts: [B] })).toEqual({ outcome: 'conflict' })
+    expect(submitFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('propagates the Host rejection code so a modality refusal can be explained', async () => {
+    const { flow } = setup(() => Promise.resolve({
+      outcome: 'rejected', reason: 'model does not support image input', code: 'session/attachment-invalid',
+    }))
+    expect(await flow.submitOnce(REQUEST)).toEqual({ outcome: 'rejected', code: 'session/attachment-invalid' })
+  })
+
+  it('propagates the rejection detail through the at-most-once boundary', async () => {
+    const { flow } = setup(() => Promise.resolve({
+      outcome: 'rejected', reason: 'attachment-invalid',
+      code: 'session/attachment-invalid', detail: 'INVALID_IMAGE',
+    }))
+    expect(await flow.submitOnce(REQUEST)).toEqual({
+      outcome: 'rejected', code: 'session/attachment-invalid', detail: 'INVALID_IMAGE',
+    })
+  })
+})

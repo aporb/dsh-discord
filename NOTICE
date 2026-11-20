@@ -1,0 +1,26 @@
+NOTICE
+
+@aporb/dsh-discord (DSH Discord) is a fork of
+addozhang/dsh-discord (https://github.com/addozhang/dsh-discord),
+Copyright (c) 2026 addozhang, distributed under the MIT License.
+
+The upstream project is a Discord adapter for DeepSeek Harness. This fork:
+
+- renames the package to @aporb/dsh-discord while keeping the plugin row id and
+  settings namespace `dsh-discord`;
+- pins the dependency matrix to the DeepSeek Harness desktop 0.2.2-rc.1 host
+  line and adapts the host face to it (live deltas from `assistant-stream`
+  frames, projection title translation, current session-list signature);
+- is an English-only build: one locale file, no language setting;
+- adds a mention-driven workspace/conversation picker, bound-channel attach,
+  `/session pick`, conversation-title sync for Discord threads, a visible
+  turn-failure line, and a one-time token/allowlist bootstrap from a legacy
+  bot env file (`DSH_DISCORD_BOOTSTRAP_ENV`, default `~/.hermes/.env`);
+- removes the upstream CI, marketplace artifacts, and Chinese documentation.
+
+The original MIT license text is kept unchanged in LICENSE, and the upstream
+copyright notice above is preserved as the license requires. Modifications in
+this fork are Copyright (c) 2026 Amyn Porb.
+
+This project is not affiliated with addozhang, DeepSeek, or Discord. It is
+distributed from GitHub (https://github.com/aporb/dsh-discord), not npm.

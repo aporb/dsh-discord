@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "DSH Discord",
+    "description": "A Discord bridge for DeepSeek Harness 0.2.2 desktop. Fork of addozhang/dsh-discord: pick an existing conversation or start a new one, follow turns in a thread with streaming replies, and answer approvals and questions with buttons.",
+    "detail": "docs/plugin-detail.en.md"
+  }
+}

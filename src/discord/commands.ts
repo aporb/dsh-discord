@@ -1,0 +1,138 @@
+/**
+ * The Milestone 1 Discord command contract (design.md §13). One declarative
+ * table feeds both the adapter's own routing metadata and the Discord
+ * registration payload, so the wire shape cannot drift from the contract:
+ * only commands the interaction router actually routes are registered —
+ * guild-only, ephemeral responses, no Discord-level permission gates
+ * (adapter RBAC decides at interaction time, deny-first).
+ *
+ * Deregistered: `/preset`, `/skill`, `/host` (their control modules stay
+ * implemented and unit-tested; they return when the router wires them,
+ * alongside `/session new|resume` — see design.md §13 and tasks 16.26/16.32).
+ */
+
+/** A command argument as the contract table declares it. */
+export interface CommandArgument {
+  name: string
+  required: boolean
+  /**
+   * Discord sends a type-4 autocomplete interaction while the user types;
+   * the adapter answers with live choices (live-candidates pattern).
+   */
+  autocomplete?: boolean
+}
+
+/** A subcommand of a top-level command. */
+export interface CommandSubcommand {
+  name: string
+  options?: CommandArgument[]
+}
+
+/** One fixed top-level command. */
+export interface AdapterCommand {
+  name: string
+  description: string
+  subcommands?: CommandSubcommand[]
+  /** Direct options for leaf commands (no subcommands). */
+  options?: CommandArgument[]
+  /** Milestone 1: guild-only; DMs are unsupported. */
+  guildOnly: true
+  /** Milestone 1: every response is ephemeral. */
+  responseVisibility: 'ephemeral'
+}
+
+function leaf(name: string, description: string, options?: CommandArgument[]): AdapterCommand {
+  return { name, description, ...(options === undefined ? {} : { options }), guildOnly: true, responseVisibility: 'ephemeral' }
+}
+
+function grouped(name: string, description: string, subcommands: CommandSubcommand[]): AdapterCommand {
+  return { name, description, subcommands, guildOnly: true, responseVisibility: 'ephemeral' }
+}
+
+/** The live command set, in registration order. */
+export const MILESTONE_ONE_COMMANDS: readonly AdapterCommand[] = [
+  grouped('project', 'Bind this channel to a DSH workspace', [
+    { name: 'list', options: [{ name: 'query', required: false, autocomplete: true }] },
+    { name: 'bind', options: [{ name: 'workspace', required: true, autocomplete: true }] },
+    { name: 'info' },
+  ]),
+  grouped('queue', 'Inspect the session inbox queue', [
+    { name: 'list' },
+    { name: 'remove', options: [{ name: 'item', required: true }] },
+  ]),
+  leaf('info', 'Show the adapter version, connection state, and project links'),
+  leaf('steer', 'Steer the running turn of this thread', [{ name: 'prompt', required: true }]),
+  leaf('stop', 'Cancel the running turn of this thread'),
+  grouped('model', 'Show or select the session model', [
+    { name: 'show' },
+    // select without a typed model opens the interactive provider → model
+    // → reasoning cascade (16.35); typing `provider/model` applies directly.
+    { name: 'select', options: [{ name: 'model', required: false }, { name: 'reasoning', required: false }] },
+  ]),
+  grouped('session', 'Follow or resume a DSH session in a thread', [
+    // Typing filters live candidates by session title (autocomplete).
+    { name: 'resume', options: [{ name: 'session', required: true, autocomplete: true }] },
+    // Fork addition: open the two-step conversation picker in a fresh (or
+    // current) thread. /session new stays absent — the @mention path with
+    // the picker's "New conversation" entry covers it.
+    { name: 'pick' },
+  ]),
+  grouped('guild', 'Guild-scoped adapter operations', [
+    { name: 'forget' },
+  ]),
+  grouped('permission', 'Show or switch the session permission preset', [
+    { name: 'show' },
+    // The preset autocompletes from the live Host catalog (16.61);
+    // danger-full-access goes through a button confirmation first.
+    { name: 'set', options: [{ name: 'preset', required: true, autocomplete: true }] },
+  ]),
+]
+
+const DISCORD_APPLICATION_COMMAND = 1
+const DISCORD_SUBCOMMAND = 1
+const DISCORD_STRING_OPTION = 3
+/** 0 = interaction context "guild" (Telegram-style contexts list; no DMs). */
+const DISCORD_GUILD_CONTEXT = 0
+
+function argumentToWire(option: CommandArgument): Record<string, unknown> {
+  return {
+    type: DISCORD_STRING_OPTION,
+    name: option.name,
+    description: option.name,
+    required: option.required,
+    ...(option.autocomplete === true ? { autocomplete: true } : {}),
+  }
+}
+
+/**
+ * Build the bulk-overwrite registration payload for
+ * `PUT /applications/{application.id}/commands`.
+ * `default_member_permissions` is deliberately OMITTED: `'0'` is Discord's
+ * "disabled for everyone except server admins" sentinel, which hid the
+ * commands from ordinary members entirely — the opposite of the adapter's
+ * model, where every command is visible to the guild and the deny-first
+ * RBAC gate authorizes at interaction time (Discord roles cannot express
+ * Workspace-administrator or Host-operator authority anyway). Omitted
+ * means @everyone may invoke, subject to the guild's own role overrides.
+ * Wire change: verify once on a real machine with a plain member account
+ * (the digital twin does not model permission gating).
+ */
+export function buildCommandRegistrations(): Array<Record<string, unknown>> {
+  return MILESTONE_ONE_COMMANDS.map((command) => {
+    const options = command.subcommands !== undefined
+      ? command.subcommands.map(sub => ({
+          type: DISCORD_SUBCOMMAND,
+          name: sub.name,
+          description: `${command.name} ${sub.name}`,
+          ...(sub.options === undefined ? {} : { options: sub.options.map(argumentToWire) }),
+        }))
+      : command.options?.map(argumentToWire)
+    return {
+      type: DISCORD_APPLICATION_COMMAND,
+      name: command.name,
+      description: command.description,
+      contexts: [DISCORD_GUILD_CONTEXT],
+      ...(options === undefined || options.length === 0 ? {} : { options }),
+    }
+  })
+}
